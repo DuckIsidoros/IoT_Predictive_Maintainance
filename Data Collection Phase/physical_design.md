@@ -1,7 +1,0 @@
-- Physical law: When the impeller becomes unbalanced, the system generates an unbalanced centrifugal force. This force is transmitted from the shaft to the bearings and subsequently propagated to the motor housing.
-- Faults Analysis:
-    - Imbalanced: X & Y.
-    - Obstruction: Z.
-- The sensor should be installed such that the X-axis is oriented horizontally, the Y-axis vertically, and the Z-axis along the axial direction of the fan rotation.
-! One face of the sensor should be flat or nearly flat.
-- The sensor should be positioned as close to the bearing as possible and mounted on the rear surface of the bearing housing.
