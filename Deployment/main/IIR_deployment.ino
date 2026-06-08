@@ -1,271 +1,286 @@
 #include <Wire.h>
 #include <math.h>
-#include <arduinoFFT.h>       // Thư viện FFT chuẩn cho Arduino/ESP32
-#include "model_parameters.h" // Đảm bảo MODEL_NUM_FEATURES trong file này đã sửa thành 6
+#include <arduinoFFT.h>
+#include "model_parameters.h" // Yêu cầu MODEL_NUM_FEATURES = 6 [cite: 1]
 
-#define I2C_SDA 21
-#define I2C_SCL 22
-#define IMU_ADDRESS 0x68
-#define IMU_REG_PWR_MGMT_1 0x6B
-#define IMU_REG_ACCEL_CONFIG 0x1C
-#define IMU_REG_ACCEL_XOUT_H 0x3B
+// --- HẰNG SỐ PHẦN CỨNG & CẤU HÌNH ---
+#define I2C_SDA             21 [cite: 1]
+#define I2C_SCL             22 [cite: 1]
+#define IMU_ADDRESS         0x68 [cite: 1]
+#define IMU_REG_PWR_MGMT_1  0x6B [cite: 1]
+#define IMU_REG_ACCEL_CONFIG 0x1C [cite: 1]
+#define IMU_REG_ACCEL_XOUT_H 0x3B [cite: 1]
 
-const float ACCEL_SCALE = 1.0f / 16384.0f; // Scale cho dải đo +/-2g
+const float ACCEL_SCALE = 1.0f / 16384.0f; // Dải đo +/-2g [cite: 1, 2]
+const int WINDOW_SIZE   = 256;             // Cửa sổ xử lý (Bắt buộc là lũy thừa của 2) [cite: 7]
+const float SAMPLING_FREQ = 200.0f;         // Tần số lấy mẫu định thời bằng hardware timer [cite: 4]
 
-struct AccelData
-{
+struct AccelData {
     int16_t x;
     int16_t y;
     int16_t z;
-};
+}; [cite: 2]
 
-// --- BỘ LỌC THÔNG CAO IIR BẬC 1 (KHỬ TRỌNG LỰC) ---
-const float HPF_ALPHA = 0.9843f; 
-float prev_raw_x = 0.0f, prev_filt_x = 0.0f;
-float prev_raw_y = 0.0f, prev_filt_y = 0.0f;
-float prev_raw_z = 0.0f, prev_filt_z = 0.0f;
+// --- BIẾN TRẠNG THÁI HỆ THỐNG (TOÀN CỤC) ---
+hw_timer_t *timer = NULL; [cite: 6]
+volatile bool samplingTriggered = false; [cite: 6]
 
-// --- ĐỊNH THỜI PHẦN CỨNG & BỘ ĐỆM FFT ---
-hw_timer_t *timer = NULL;
-volatile bool samplingTriggered = false;
+// Khởi tạo các mảng tĩnh lưu trữ phổ tần số, chống phân mảnh bộ nhớ (Zero Heap Allocation)
+static float fft_vReal[WINDOW_SIZE];
+static float fft_vImag[WINDOW_SIZE];
+ArduinoFFT<float> FFT = ArduinoFFT<float>(fft_vReal, fft_vImag, WINDOW_SIZE, SAMPLING_FREQ);
 
-// Thay đổi sang 256 mẫu (Power of 2) để thỏa mãn điều kiện đầu vào của toán tử FFT
-const int WINDOW_SIZE = 256; 
-int sampleCount = 0;
-float sumSqX = 0, sumSqY = 0, sumSqZ = 0;
+// Biến toàn cục phục vụ Dashboard hiển thị dữ liệu
+float class_probabilities[MODEL_NUM_CLASSES] = {0.0f}; [cite: 9]
+int predicted_class_idx = 0; [cite: 10]
+unsigned long inference_latency_us = 0; [cite: 10]
 
-// Bộ đệm FFT dành riêng cho trục Z (Trục đo rung cơ học chính của quạt DC)
-float fft_vReal[WINDOW_SIZE];
-float fft_vImag[WINDOW_SIZE];
-ArduinoFFT<float> FFT = ArduinoFFT<float>(fft_vReal, fft_vImag, WINDOW_SIZE, 200.0f);
+// --- PROTOTYPES ---
+bool IMU_Init();
+bool IMU_ReadAcceleration(AccelData &data);
+void apply_iir_filter(const AccelData &raw, float &fx, float &fy, float &fz);
+void accumulate_metrics(float fx, float fy, float fz);
+void compute_features_and_infer();
+void predict_logistic_regression(float rx, float ry, float rz, float bLow, float bMid, float bHigh);
+void print_dashboard(float rx, float ry, float rz, float bLow, float bMid, float bHigh);
 
-// Biến toàn cục hệ thống
-float class_probabilities[MODEL_NUM_CLASSES] = {0.0f};
-int predicted_class_idx = 0;
-unsigned long inference_latency_us = 0;
-
-void IRAM_ATTR onTimer()
-{
-    samplingTriggered = true;
+// --- HARDWARE TIMER INTERRUPT SERVICE ROUTINE (ISR) ---
+void IRAM_ATTR onTimer() {
+    samplingTriggered = true; [cite: 10, 11]
 }
 
-bool IMU_Init()
-{
-    Wire.begin(I2C_SDA, I2C_SCL);
-    Wire.setClock(400000); 
-    delay(100);
-    Wire.beginTransmission(IMU_ADDRESS);
-    Wire.write(IMU_REG_PWR_MGMT_1);
-    Wire.write(0x00); 
-    if (Wire.endTransmission() != 0) return false;
-    delay(50);
+void setup() {
+    Serial.begin(115200); [cite: 49]
+    while (!Serial); [cite: 49]
 
-    Wire.beginTransmission(IMU_ADDRESS);
-    Wire.write(IMU_REG_ACCEL_CONFIG);
-    Wire.write(0x00); 
-    if (Wire.endTransmission() != 0) return false;
-    delay(50);
-    return true;
+    if (!IMU_Init()) { [cite: 49]
+        Serial.println(F("CRITICAL ERROR: IMU Hardware Initialization Failed. System Halted.")); [cite: 50]
+        while (1); [cite: 50, 51]
+    }
+
+    // Định thời ngắt cứng chính xác 5ms (200Hz)
+    timer = timerBegin(0, 80, true); [cite: 52]
+    timerAttachInterrupt(timer, &onTimer, true); [cite: 52]
+    timerAlarmWrite(timer, 5000, true); [cite: 52]
+    timerAlarmEnable(timer); [cite: 52]
 }
 
-bool IMU_ReadAcceleration(AccelData &data)
-{
-    Wire.beginTransmission(IMU_ADDRESS);
-    Wire.write(IMU_REG_ACCEL_XOUT_H);
-    if (Wire.endTransmission(false) != 0) return false;
-    if (Wire.requestFrom(IMU_ADDRESS, 6) < 6) return false;
+void loop() {
+    if (!samplingTriggered) return;
+    samplingTriggered = false; // Xóa cờ ngắt phần cứng ngay lập tức để giải phóng chu kỳ [cite: 53]
 
-    data.x = (Wire.read() << 8) | Wire.read();
-    data.y = (Wire.read() << 8) | Wire.read();
-    data.z = (Wire.read() << 8) | Wire.read();
-    return true;
+    AccelData rawData; [cite: 54]
+    if (IMU_ReadAcceleration(rawData)) { [cite: 54]
+        float fx = 0.0f, fy = 0.0f, fz = 0.0f;
+        
+        apply_iir_filter(rawData, fx, fy, fz);
+        accumulate_metrics(fx, fy, fz);
+        
+        // Khi gom đủ một cửa sổ dữ liệu thực tế, tiến hành rút trích đặc trưng tần số và định danh lỗi
+        if (fft_vImag[WINDOW_SIZE - 1] >= 1.0f) { // Sử dụng phần ảo làm cờ báo đầy mảng (Tiết kiệm biến đếm)
+            compute_features_and_infer();
+        }
+    }
 }
 
-// --- THUẬT TOÁN SUY LUẬN LOGISTIC REGRESSION CHUẨN SOFTMAX ---
-void predict_logistic_regression(float rmsX, float rmsY, float rmsZ, float bpLow, float bpMid, float bpHigh)
-{
-    // Vector đặc trưng đầu vào đã nâng lên 6 chiều, khớp hoàn chỉnh cấu trúc phân tích
-    float raw_features[6] = {rmsX, rmsY, rmsZ, bpLow, bpMid, bpHigh};
-    float normalized_features[6];
-    float logit_scores[MODEL_NUM_CLASSES] = {0.0f};
+// --- MODULE 1: GIAO TIẾP VÀ KHỞI TẠO PHẦN CỨNG SENSOR ---
+bool IMU_Init() {
+    Wire.begin(I2C_SDA, I2C_SCL); [cite: 11]
+    Wire.setClock(400000); // 400kHz Fast-mode tối ưu I2C Bus [cite: 11]
+    delay(100); [cite: 11]
 
-    // 1. Chuẩn hóa dữ liệu đầu vào (Z-score Scaling)
-    for (int f = 0; f < 6; f++)
-    {
-        normalized_features[f] = (raw_features[f] - SCALER_MEAN[f]) / SCALER_STD[f];
+    Wire.beginTransmission(IMU_ADDRESS); [cite: 12]
+    Wire.write(IMU_REG_PWR_MGMT_1); [cite: 12]
+    Wire.write(0x00); // Kích hoạt nguồn cảm biến [cite: 12]
+    if (Wire.endTransmission() != 0) return false; [cite: 12]
+    delay(50); [cite: 13]
+
+    Wire.beginTransmission(IMU_ADDRESS); [cite: 13]
+    Wire.write(IMU_REG_ACCEL_CONFIG); [cite: 13]
+    Wire.write(0x00); // Khóa cứng dải đo gia tốc toàn thang +/-2g [cite: 13]
+    if (Wire.endTransmission() != 0) return false; [cite: 13]
+    delay(50); [cite: 14]
+
+    return true; [cite: 14]
+}
+
+bool IMU_ReadAcceleration(AccelData &data) {
+    Wire.beginTransmission(IMU_ADDRESS); [cite: 14]
+    Wire.write(IMU_REG_ACCEL_XOUT_H); [cite: 14]
+    if (Wire.endTransmission(false) != 0) return false; [cite: 15]
+    if (Wire.requestFrom(IMU_ADDRESS, 6) < 6) return false; [cite: 16]
+
+    data.x = (Wire.read() << 8) | Wire.read(); [cite: 16, 17]
+    data.y = (Wire.read() << 8) | Wire.read(); [cite: 17]
+    data.z = (Wire.read() << 8) | Wire.read(); [cite: 17]
+    return true; [cite: 17]
+}
+
+// --- MODULE 2: XỬ LÝ TÍN HIỆU SỐ (DSP) ---
+void apply_iir_filter(const AccelData &raw, float &fx, float &fy, float &fz) {
+    const float HPF_ALPHA = 0.9843f; // Tần số cắt ~0.5Hz ở chu kỳ 200Hz [cite: 3, 4]
+    static float p_rx = 0.0f, p_fx = 0.0f; [cite: 4]
+    static float p_ry = 0.0f, p_fy = 0.0f; [cite: 5]
+    static float p_rz = 0.0f, p_fz = 0.0f; [cite: 5]
+
+    float crx = (float)raw.x * ACCEL_SCALE; [cite: 54, 55]
+    float cry = (float)raw.y * ACCEL_SCALE; [cite: 55]
+    float crz = (float)raw.z * ACCEL_SCALE; [cite: 56]
+
+    // Thực thi bộ lọc thông cao IIR để bảo vệ hệ thống trước hiện tượng lệch DC (Drift) tĩnh [cite: 56]
+    fx = HPF_ALPHA * (p_fx + crx - p_rx); [cite: 57]
+    fy = HPF_ALPHA * (p_fy + cry - p_ry); [cite: 57]
+    fz = HPF_ALPHA * (p_fz + crz - p_rz); [cite: 58]
+
+    p_rx = crx; p_fx = fx; [cite: 58, 59]
+    p_ry = cry; p_fy = fy; [cite: 59]
+    p_rz = crz; p_fz = fz; [cite: 59, 60]
+}
+
+void accumulate_metrics(float fx, float fy, float fz) {
+    static int idx = 0;
+    static float sSqX = 0, sSqY = 0, sSqZ = 0;
+
+    sSqX += fx * fx; [cite: 60, 61]
+    sSqY += fy * fy; [cite: 61]
+    sSqZ += fz * fz; [cite: 61]
+
+    // Tích lũy chuỗi thời gian trục Z trực tiếp vào bộ đệm của FFT [cite: 61]
+    fft_vReal[idx] = fz;
+    fft_vImag[idx] = 0.0f;
+    idx++;
+
+    if (idx >= WINDOW_SIZE) {
+        idx = 0;
+        // Đánh dấu mảng đã đầy bằng cách mượn phần tử cuối của mảng ảo (Tiết kiệm RAM biến đếm)
+        fft_vImag[WINDOW_SIZE - 1] = 999.0f; 
+        
+        // Lưu giữ tạm thời kết quả tổng bình phương miền thời gian
+        fft_vReal[0] = sSqX; 
+        fft_vReal[1] = sSqY; 
+        fft_vReal[2] = sSqZ;
+        
+        sSqX = 0.0f; sSqY = 0.0f; sSqZ = 0.0f; [cite: 66, 67]
+    }
+}
+
+void compute_features_and_infer() {
+    // Phục hồi tổng bình phương miền thời gian từ bộ đệm tạm thời
+    float sSqX = fft_vReal[0];
+    float sSqY = fft_vReal[1];
+    float sSqZ = fft_vReal[2];
+
+    float rmsX = sqrt(sSqX / (float)WINDOW_SIZE); [cite: 62, 63]
+    float rmsY = sqrt(sSqY / (float)WINDOW_SIZE); [cite: 63]
+    float rmsZ = sqrt(sSqZ / (float)WINDOW_SIZE); [cite: 63, 64]
+
+    // Chạy giải thuật FFT miền tần số cho riêng trục Z
+    FFT.windowing(FFT_WIN_TYP_HANN, FFT_FORWARD); 
+    FFT.compute(FFT_FORWARD);
+    FFT.complexToMagnitude();
+
+    float bpLow = 0.0f, bpMid = 0.0f, bpHigh = 0.0f;
+    const float bin_width = SAMPLING_FREQ / (float)WINDOW_SIZE;
+
+    // Trích xuất Band Power với bước Chuẩn hóa Biên độ bắt buộc (Chia cho N) để khớp 100% với Python
+    for (int i = 0; i < WINDOW_SIZE / 2; i++) {
+        float freq = (float)i * bin_width;
+        float norm_mag = fft_vReal[i] / (float)WINDOW_SIZE; 
+        float magSq = norm_mag * norm_mag;
+
+        if (freq >= 0.0f && freq < 20.0f)        bpLow += magSq;
+        else if (freq >= 20.0f && freq < 60.0f)  bpMid += magSq;
+        else if (freq >= 60.0f && freq <= 100.0f) bpHigh += magSq;
     }
 
-    // 2. Tính toán điểm số Logit độc lập (One-vs-Rest)
-    float max_score = -999999.0f;
-    for (int c = 0; c < MODEL_NUM_CLASSES; c++)
-    {
-        float score = LGR_BIASES[c];
-        for (int f = 0; f < 6; f++)
-        {
-            score += normalized_features[f] * LGR_WEIGHTS[c][f];
+    // Thực thi đo đạc hiệu năng và suy luận mô hình ML
+    unsigned long start_bench = micros(); [cite: 64]
+    predict_logistic_regression(rmsX, rmsY, rmsZ, bpLow, bpMid, bpHigh); [cite: 65]
+    inference_latency_us = micros() - start_bench; [cite: 65]
+
+    print_dashboard(rmsX, rmsY, rmsZ, bpLow, bpMid, bpHigh); [cite: 65]
+}
+
+// --- MODULE 3: SUY LUẬN LOGISTIC REGRESSION (SOFTMAX ỔN ĐỊNH SỐ HỌC) ---
+void predict_logistic_regression(float rx, float ry, float rz, float bLow, float bMid, float bHigh) {
+    float raw_features[6] = {rx, ry, rz, bLow, bMid, bHigh}; [cite: 18, 19]
+    float normalized_features[6]; [cite: 19]
+    float logit_scores[MODEL_NUM_CLASSES] = {0.0f}; [cite: 19]
+
+    // 1. Z-score Normalization (Khớp hoàn toàn cấu trúc StandardScaler của Python)
+    for (int f = 0; f < 6; f++) {
+        normalized_features[f] = (raw_features[f] - SCALER_MEAN[f]) / SCALER_STD[f]; [cite: 19, 20]
+    }
+
+    // 2. Nhân ma trận tính điểm số Logit (One-vs-Rest) & tìm Max Score để chống tràn số toán học [cite: 21]
+    float max_score = -999999.0f; [cite: 20]
+    for (int c = 0; c < MODEL_NUM_CLASSES; c++) {
+        float score = LGR_BIASES[c]; [cite: 21, 22]
+        for (int f = 0; f < 6; f++) {
+            score += normalized_features[f] * LGR_WEIGHTS[c][f]; [cite: 22, 23]
         }
-        logit_scores[c] = score;
-        if (score > max_score) {
-            max_score = score; // Giữ lại max_score phục vụ kỹ thuật toán học Softmax
+        logit_scores[c] = score; [cite: 23]
+        if (score > max_score) max_score = score; [cite: 24]
+    }
+
+    // 3. Phép toán Argmax tìm chỉ số lớp có điểm cao nhất
+    predicted_class_idx = 0; [cite: 26]
+    float current_max = logit_scores[0]; [cite: 27]
+    for (int c = 1; c < MODEL_NUM_CLASSES; c++) {
+        if (logit_scores[c] > current_max) { [cite: 27]
+            current_max = logit_scores[c]; [cite: 27]
+            predicted_class_idx = c; [cite: 28]
         }
     }
 
-    // 3. Thực thi toán tử Argmax chọn lớp có điểm cao nhất
-    predicted_class_idx = 0;
-    float current_max = logit_scores[0];
-    for (int c = 1; c < MODEL_NUM_CLASSES; c++)
-    {
-        if (logit_scores[c] > current_max)
-        {
-            current_max = logit_scores[c];
-            predicted_class_idx = c;
-        }
-    }
-
-    // 4. Thuật toán SOFTMAX ổn định số học (Numerical Stability) chống tràn số FPU
+    // 4. Hàm SOFTMAX phi tuyến chuẩn định dạng toán học (Chống tràn số bằng Max-subtraction)
     float sum_exp = 0.0f;
-    for (int c = 0; c < MODEL_NUM_CLASSES; c++)
-    {
+    for (int c = 0; c < MODEL_NUM_CLASSES; c++) {
         class_probabilities[c] = exp(logit_scores[c] - max_score); 
-        sum_exp += class_probabilities[c];
+        sum_exp += class_probabilities[c]; [cite: 32]
     }
-    
-    // Đưa về dải phân phối xác suất chuẩn [0.0 - 1.0]
+
     if (sum_exp > 0.0f) {
         for (int c = 0; c < MODEL_NUM_CLASSES; c++) {
-            class_probabilities[c] /= sum_exp;
+            class_probabilities[c] /= sum_exp; [cite: 33]
+        }
+    } else {
+        // Dự phòng biên an toàn nếu có lỗi tính toán nghiêm trọng
+        for (int c = 0; c < MODEL_NUM_CLASSES; c++) {
+            class_probabilities[c] = 1.0f / (float)MODEL_NUM_CLASSES; [cite: 34]
         }
     }
 }
 
-// --- MODULE HIỂN THỊ DASHBOARD TERMINAL ---
-void print_dashboard(float rmsX, float rmsY, float rmsZ, float bpLow, float bpMid, float bpHigh)
-{
-    Serial.print("\033[2J");
-    Serial.print("\033[H");
+// --- MODULE 4: HÀM HIỂN THỊ DASHBOARD TERMINAL ---
+void print_dashboard(float rx, float ry, float rz, float bLow, float bMid, float bHigh) {
+    Serial.print("\033[2J"); [cite: 35]
+    Serial.print("\033[H"); [cite: 35]
 
     Serial.println(F("====================================================================="));
-    Serial.println(F("[1] EDGE DATA ACQUISITION & SIGNAL FILTERING (Cửa sổ 256 mẫu)"));
-    Serial.printf("- RMS X: %.4fG  |  RMS Y: %.4fG  |  RMS Z (Khử g): %.4fG\n", rmsX, rmsY, rmsZ);
-    Serial.printf("- BandPower Low (0-20Hz): %.2f | Mid (20-60Hz): %.2f | High (60-100Hz): %.2f\n", bpLow, bpMid, bpHigh);
-    Serial.println();
+    Serial.println(F("[1] EDGE SIGNAL PROCESSING (Cửa sổ phẳng 256 mẫu - Khử Trọng Lực)"));
+    Serial.printf("- RMS Trục X: %.4fG  |  RMS Trục Y: %.4fG  |  RMS Trục Z: %.4fG\n", rx, ry, rz); [cite: 36, 37]
+    Serial.printf("- BandPower Low: %.4f | Mid: %.4f | High: %.4f\n", bLow, bMid, bHigh);
+    Serial.println(); [cite: 37]
 
-    Serial.println(F("[2] LOGISTIC REGRESSION ON-CHIP SUY LUẬN (Softmax Matrix)"));
-    for (int c = 0; c < MODEL_NUM_CLASSES; c++)
-    {
-        int bar_length = (int)(class_probabilities[c] * 20.0f);
-        if (bar_length > 20) bar_length = 20;
-        if (bar_length < 0)  bar_length = 0;
+    Serial.println(F("[2] CHUẨN SOFTMAX ON-CHIP SUY LUẬN (Logistic Regression)")); [cite: 37]
+    for (int c = 0; c < MODEL_NUM_CLASSES; c++) {
+        int bar_length = (int)(class_probabilities[c] * 20.0f); [cite: 38]
+        if (bar_length > 20) bar_length = 20; [cite: 38, 39]
+        if (bar_length < 0)  bar_length = 0; [cite: 39, 40]
         
-        Serial.printf("- Trạng thái %-15s : [", MODEL_CLASS_LABELS[c]);
+        Serial.printf("- Trạng thái %-15s : [", MODEL_CLASS_LABELS[c]); [cite: 40, 41]
         for (int i = 0; i < 20; i++) {
-            Serial.print(i < bar_length ? "|" : ".");
+            Serial.print(i < bar_length ? "|" : "."); [cite: 41, 42]
         }
-        Serial.printf("] %.1f%%\n", class_probabilities[c] * 100.0f);
+        Serial.printf("] %.1f%%\n", class_probabilities[c] * 100.0f); [cite: 42]
     }
-    Serial.println();
-    Serial.printf(" => KẾT LUẬN HỆ THỐNG: [Class %d] -> QUẠT CHẠY Ở TRẠNG THÁI: %s\n",
-                  predicted_class_idx, MODEL_CLASS_LABELS[predicted_class_idx]);
-    Serial.println();
+    Serial.println(); [cite: 43]
+    Serial.printf(" => KẾT LUẬN CHẨN ĐOÁN: QUẠT CHẠY Ở TRẠNG THÁI -> [%s]\n", MODEL_CLASS_LABELS[predicted_class_idx]); [cite: 43, 44]
+    Serial.println(); [cite: 44]
 
-    Serial.println(F("[3] HARDWARE TIMING & RESOURCES BENCHMARK"));
-    Serial.printf("- Thời gian thực thi phép suy luận ML: %d us\n", inference_latency_us);
-    Serial.printf("- Free Heap RAM hệ thống hiện tại   : %d bytes\n", esp_get_free_heap_size());
-    Serial.println(F("====================================================================="));
-}
-
-void setup()
-{
-    Serial.begin(115200);
-    while (!Serial);
-    if (!IMU_Init())
-    {
-        Serial.println("IMU Initialization Error! System Halted.");
-        while (1);
-    }
-
-    // Cấu hình Hardware Timer định thời ngắt chính xác 5ms (200Hz)
-    timer = timerBegin(0, 80, true);
-    timerAttachInterrupt(timer, &onTimer, true);
-    timerAlarmWrite(timer, 5000, true);
-    timerAlarmEnable(timer);
-}
-
-void loop()
-{
-    if (samplingTriggered)
-    {
-        samplingTriggered = false; // Xóa cờ ngắt phần cứng
-
-        AccelData rawData;
-        if (IMU_ReadAcceleration(rawData))
-        {
-            // Đổi counts sang g
-            float curr_raw_x = (float)rawData.x * ACCEL_SCALE;
-            float curr_raw_y = (float)rawData.y * ACCEL_SCALE;
-            float curr_raw_z = (float)rawData.z * ACCEL_SCALE;
-
-            // Thực thi bộ lọc thông cao khử trọng lực
-            float curr_filt_x = HPF_ALPHA * (prev_filt_x + curr_raw_x - prev_raw_x);
-            float curr_filt_y = HPF_ALPHA * (prev_filt_y + curr_raw_y - prev_raw_y);
-            float curr_filt_z = HPF_ALPHA * (prev_filt_z + curr_raw_z - prev_raw_z);
-
-            // Lưu vết trạng thái bộ lọc
-            prev_raw_x = curr_raw_x; prev_filt_x = curr_filt_x;
-            prev_raw_y = curr_raw_y; prev_filt_y = curr_filt_y;
-            prev_raw_z = curr_raw_z; prev_filt_z = curr_filt_z;
-
-            // 1. Tính toán RMS cuốn chiếu số thực
-            sumSqX += curr_filt_x * curr_filt_x;
-            sumSqY += curr_filt_y * curr_filt_y;
-            sumSqZ += curr_filt_z * curr_filt_z;
-
-            // 2. Ghi dữ liệu trục Z vào Buffer để chuẩn bị tính toán dải tần FFT
-            fft_vReal[sampleCount] = curr_filt_z;
-            fft_vImag[sampleCount] = 0.0f; // Phần ảo khởi tạo bằng 0
-            
-            sampleCount++;
-
-            // Khi tích lũy đủ 256 mẫu cơ học (~1.28 giây dữ liệu thực tế ở tần số 200Hz)
-            if (sampleCount >= WINDOW_SIZE)
-            {
-                // Trích xuất RMS cuối cùng của cửa sổ
-                float rmsX = sqrt(sumSqX / (float)WINDOW_SIZE);
-                float rmsY = sqrt(sumSqY / (float)WINDOW_SIZE);
-                float rmsZ = sqrt(sumSqZ / (float)WINDOW_SIZE);
-
-                // 3. THỰC THI MODULE FFT TRÊN CHIP ĐỂ LẤY BIÊN ĐỘ PHỔ
-                FFT.windowing(FFT_WIN_TYP_HAMMING, FFT_FORWARD); // Áp dụng cửa sổ Hamming khử nhiễu rò rỉ phổ
-                FFT.compute(FFT_FORWARD);                        // Thực thi phép biến đổi FFT
-                FFT.complexToMagnitude();                        // Chuyển kết quả sang mảng biên độ (Lưu đè vào mảng fft_vReal)
-
-                // 4. TRÍCH XUẤT NĂNG LƯỢNG DẢI TẦN (BAND POWER) KHỚP LOGIC PYTHON
-                float bpLow = 0.0f, bpMid = 0.0f, bpHigh = 0.0f;
-                
-                for (int i = 0; i < WINDOW_SIZE / 2; i++)
-                {
-                    // Tính toán tần số vật lý chính xác của Bin thứ i: Freq = i * Sampling_Rate / N
-                    float freq = (float)i * 200.0f / (float)WINDOW_SIZE;
-                    float magSq = fft_vReal[i] * fft_vReal[i]; // Năng lượng = biên độ bình phương
-
-                    // Gom năng lượng vào đúng dải ranh giới logic của Python
-                    if (freq >= 0.0f && freq < 20.0f)       bpLow += magSq;
-                    else if (freq >= 20.0f && freq < 60.0f)  bpMid += magSq;
-                    else if (freq >= 60.0f && freq <= 100.0f) bpHigh += magSq;
-                }
-
-                // Đo đạc thời gian suy luận ML bao gồm cả cấu trúc mạng
-                unsigned long start_bench = micros();
-                predict_logistic_regression(rmsX, rmsY, rmsZ, bpLow, bpMid, bpHigh);
-                inference_latency_us = micros() - start_bench;
-
-                // Xuất giao diện đồ họa
-                print_dashboard(rmsX, rmsY, rmsZ, bpLow, bpMid, bpHigh);
-
-                // Reset toàn bộ trạng thái chuẩn bị cho chu kỳ gom mẫu tiếp theo
-                sampleCount = 0;
-                sumSqX = 0.0f; sumSqY = 0.0f; sumSqZ = 0.0f;
-            }
-        }
-    }
+    Serial.println(F("[3] RESOURCE BENCHMARK")); [cite: 44]
+    Serial.printf("- Trễ tính toán thuật toán AI (Inference Latency): %d us\n", inference_latency_us); [cite: 45]
+    Serial.printf("- Free Heap RAM hiện tại của ESP32               : %d bytes\n", esp_get_free_heap_size()); [cite: 47]
+    Serial.println(F("=====================================================================")); [cite: 48]
 }
