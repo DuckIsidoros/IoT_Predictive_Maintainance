@@ -22,28 +22,29 @@ float prev_raw_z = 0.0f, prev_filt_z = 0.0f;
 
 const char *CURRENT_LABEL = "healthy";
 
-// Sử dụng kiểu dữ liệu mới cho ESP32 Core 3.x
 hw_timer_t *timer = NULL;
 volatile bool samplingTriggered = false;
+volatile uint32_t last_sample_time_us = 0; // Lưu thời gian thực tính bằng microgiây
 uint32_t error_counter = 0;
 
 void IRAM_ATTR onTimer() {
     samplingTriggered = true;
+    last_sample_time_us = micros(); // Lấy mốc thời gian chính xác tuyệt đối từ ngắt cứng
 }
 
 bool IMU_Init() {
     Wire.begin(I2C_SDA, I2C_SCL);
-    Wire.setClock(400000); // Nâng lên 400kHz để giải phóng Timing Budget
+    Wire.setClock(400000); 
     delay(50);
 
     Wire.beginTransmission(IMU_ADDRESS);
     Wire.write(IMU_REG_PWR_MGMT_1);
-    Wire.write(0x00); // Wake up
+    Wire.write(0x00); 
     if (Wire.endTransmission() != 0) return false;
 
     Wire.beginTransmission(IMU_ADDRESS);
     Wire.write(IMU_REG_ACCEL_CONFIG);
-    Wire.write(0x00); // +/- 2g
+    Wire.write(0x00); 
     if (Wire.endTransmission() != 0) return false;
 
     return true;
@@ -67,30 +68,30 @@ void setup() {
     while (!Serial);
 
     if (!IMU_Init()) {
-        Serial.println("IMU Init Failed!");
+        Serial.println("ERROR: IMU Initialization Failed");
         while (1); 
     }
 
-    // Cập nhật API Timer mới theo chuẩn ESP32 Arduino Core v3.x
-    // Tần số tick = 1,000,000 Hz (1 us/tick). 5000 ticks = 5ms = 200Hz
     timer = timerBegin(1000000); 
     timerAttachInterrupt(timer, &onTimer);
-    timerAlarm(timer, 5000, true, 0); 
+    timerAlarm(timer, 5000, true, 0); // Khóa cứng chu kỳ 5000 us = 5 ms (200Hz)
 }
 
 void loop() {
     if (samplingTriggered) {
         samplingTriggered = false;
+        
+        // Đọc snapshot thời gian từ ngắt để tránh bị lệch chu kỳ do toán tử phía sau
+        uint32_t sample_timestamp_us = last_sample_time_us; 
 
         AccelData raw_counts;
         if (IMU_ReadAccel(raw_counts)) {
-            error_counter = 0; // Reset counter khi đọc thành công
+            error_counter = 0; 
 
             float curr_raw_x = (float)raw_counts.x * ACCEL_SCALE;
             float curr_raw_y = (float)raw_counts.y * ACCEL_SCALE;
             float curr_raw_z = (float)raw_counts.z * ACCEL_SCALE;
 
-            // IIR High-pass Filter
             float curr_filt_x = HPF_ALPHA * (prev_filt_x + curr_raw_x - prev_raw_x);
             float curr_filt_y = HPF_ALPHA * (prev_filt_y + curr_raw_y - prev_raw_y);
             float curr_filt_z = HPF_ALPHA * (prev_filt_z + curr_raw_z - prev_raw_z);
@@ -99,17 +100,20 @@ void loop() {
             prev_raw_y = curr_raw_y; prev_filt_y = curr_filt_y;
             prev_raw_z = curr_raw_z; prev_filt_z = curr_filt_z;
 
-            // In dữ liệu (Khuyên dùng: Tăng baudrate Serial lên 230400 hoặc 460800 nếu log thêm data)
-            Serial.print(curr_raw_x, 4);   Serial.print(",");
-            Serial.print(curr_filt_x, 4);  Serial.print(",");
-            Serial.print(curr_raw_y, 4);   Serial.print(",");
-            Serial.print(curr_filt_y, 4);  Serial.print(",");
-            Serial.print(curr_raw_z, 4);   Serial.print(",");
-            Serial.print(curr_filt_z, 4);  Serial.print(",");
+            // Chuyển đổi us sang ms dạng số thực để giữ nguyên độ chính xác cao cho validator
+            float timestamp_ms = (float)sample_timestamp_us / 1000.0f;
+
+            // In dữ liệu ra Serial theo đúng cấu trúc cột yêu cầu
+            Serial.print(timestamp_ms, 3); Serial.print(",");
+            Serial.print(curr_raw_x, 4);    Serial.print(",");
+            Serial.print(curr_filt_x, 4);   Serial.print(",");
+            Serial.print(curr_raw_y, 4);    Serial.print(",");
+            Serial.print(curr_filt_y, 4);   Serial.print(",");
+            Serial.print(curr_raw_z, 4);    Serial.print(",");
+            Serial.print(curr_filt_z, 4);   Serial.print(",");
             Serial.println(CURRENT_LABEL);
         } else {
             error_counter++;
-            // Nếu lỗi liên tục trong 1 giây (200 chu kỳ), tiến hành Re-init Bus
             if (error_counter > 200) {
                 IMU_Init();
                 error_counter = 0;
