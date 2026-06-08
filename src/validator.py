@@ -60,6 +60,12 @@ def parse_args():
         help="Move real files from incoming to accepted/rejected based on validation status.",
     )
 
+    parser.add_argument(
+        "--accept-warnings",
+        action="store_true",
+        help="Allow real files with WARNING status to be moved to accepted. By default, only PASS is accepted.",
+    )
+
     return parser.parse_args()
 
 
@@ -214,7 +220,10 @@ def validate_file(file_path, expected_status=None, mode="mock"):
             label = infer_label_from_filename(file_path)
             result["label"] = label
             result["label_source"] = "filename"
-            add_reason(result, "WARNING", "label_column_empty_using_filename")
+            if mode =="real":
+                add_reason(result, "FAIL", "missing_label_column_and_cannot_infer_from_filename")
+            else:
+                add_reason(result, "WARNING", "label_column_empty_using_filename")
         else:
             add_reason(result, "FAIL", "mixed_labels_in_file")
             result["label"] = ";".join(unique_labels)
@@ -225,7 +234,7 @@ def validate_file(file_path, expected_status=None, mode="mock"):
         result["label_source"] = "filename"
 
         if mode == "real":
-            add_reason(result, "WARNING", "missing_label_column_using_filename")
+            add_reason(result, "FAIL", "missing_label_column")
         else:
             add_reason(result, "FAIL", "missing_label_column")
 
@@ -347,11 +356,18 @@ def collect_mock_files(paths):
     clean_dir = paths["raw"]
     corrupted_dir = paths["corrupted"]
 
-    for file_path in sorted(clean_dir.rglob("*.csv")):
-        files.append((file_path, "PASS"))
+    for label in CLASS_LABELS:
+        class_dir = clean_dir / label
 
-    for file_path in sorted(corrupted_dir.rglob("*.csv")):
-        files.append((file_path, "FAIL"))
+        if not class_dir.exists():
+            continue
+
+        for file_path in sorted(class_dir.glob("*.csv")):
+            files.append((file_path, "PASS"))
+
+    if corrupted_dir.exists():
+        for file_path in sorted(corrupted_dir.rglob("*.csv")):
+            files.append((file_path, "FAIL"))
 
     return files
 
@@ -381,17 +397,19 @@ def collect_real_files(paths):
 # REAL FILE ROUTING
 # =========================================================
 
-def route_real_file(file_path, status, paths):
+def route_real_file(file_path, status, paths, accept_warnings=False):
     """
     Move real files from incoming to accepted or rejected folder.
 
-    PASS and WARNING are accepted for now.
-    FAIL files are rejected.
+    PASS files are accepted.
+    WARNING files are rejected unless --accept-warnings is specified.
     """
 
     file_path = Path(file_path)
 
-    if status in ["PASS", "WARNING"]:
+    should_accept = status == "PASS" or (status == "WARNING" and accept_warnings)
+
+    if should_accept:
         target_dir = paths["raw"]
     else:
         target_dir = paths["rejected"]
@@ -406,7 +424,6 @@ def route_real_file(file_path, status, paths):
     shutil.move(str(file_path), str(target_path))
 
     return target_path
-
 
 # =========================================================
 # REPORTING
@@ -456,7 +473,7 @@ def print_summary(report_df, mode):
 # MAIN PIPELINE
 # =========================================================
 
-def run_validation(mode, move_real_files=False):
+def run_validation(mode, move_real_files=False, accept_warnings=False):
     """
     Run validation pipeline for mock or real mode.
     """
@@ -482,6 +499,7 @@ def run_validation(mode, move_real_files=False):
     print(f"Expected fs      : {SAMPLING_RATE_HZ} Hz")
     print(f"Report file      : {report_file}")
     print(f"Move real files  : {move_real_files}")
+    print(f"Accept warnings   : {accept_warnings}")
     print("======================================")
 
     results = []
@@ -498,6 +516,7 @@ def run_validation(mode, move_real_files=False):
                 file_path=file_path,
                 status=result["status"],
                 paths=paths,
+                accept_warnings=accept_warnings,
             )
             result["routed_to"] = str(routed_path)
         else:
@@ -514,7 +533,7 @@ def run_validation(mode, move_real_files=False):
             print(f"[{result['status']}] {file_path}")
 
         if result["status"] in ["WARNING", "FAIL"]:
-            print(f"     reasons: {result['reasons']}")
+            print(f"reasons: {result['reasons']}")
 
     report_df = save_report(results, report_file)
 
@@ -531,6 +550,7 @@ def main():
     run_validation(
         mode=args.mode,
         move_real_files=args.move_real_files,
+        accept_warnings=args.accept_warnings,
     )
 
 
