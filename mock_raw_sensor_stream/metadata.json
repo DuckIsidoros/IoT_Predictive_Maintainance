@@ -1,8 +1,0 @@
-{
-  "sampling_rate": 200,
-  "record_duration_sec": 30,
-  "total_samples": 6000,
-  "files_per_class": 20,
-  "classes": ["healthy", "imbalance", "obstruction"],
-  "columns": ["timestamp_ms", "accX", "accY", "accZ", "label"]
-}

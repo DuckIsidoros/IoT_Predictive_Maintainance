@@ -1,27 +1,69 @@
-import os
+import argparse  
+from pathlib import Path  
+
 import numpy as np
 import pandas as pd
 
+from config import (  #  Centralize pipeline configuration in config.py.
+    SAMPLING_RATE_HZ,
+    WINDOW_SIZE,
+    EXPECTED_FFT_BINS,
+    EXPECTED_FREQ_MAX_HZ,
+    NYQUIST_FREQUENCY_HZ,
+    FREQ_RESOLUTION_HZ,
+    CLASS_LABELS,
+    get_paths,
+)
+
+
 # =========================================================
-# CONFIG
+# CONSTANTS
 # =========================================================
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-WINDOW_ROOT = os.path.join(BASE_DIR, "windows")
-OUTPUT_ROOT = os.path.join(BASE_DIR, "fft_windows")
-REPORT_PATH = os.path.join(BASE_DIR, "fft_report.csv")
-
-EXPECTED_FS = 200  # Hz
-EXPECTED_WINDOW_SIZE = 256  # samples
-
-EXPECTED_FFT_BINS = EXPECTED_WINDOW_SIZE // 2 + 1  # 129 bins
-NYQUIST_FREQUENCY_HZ = EXPECTED_FS / 2             # 100 Hz
-FREQ_RESOLUTION_HZ = EXPECTED_FS / EXPECTED_WINDOW_SIZE  # 0.78125 Hz
-
+#  Keep required columns local because they are specific to window CSV schema.
 REQUIRED_COLUMNS = ["timestamp_ms", "accX", "accY", "accZ", "label"]
+
+#  Keep sensor columns local because FFT only uses acceleration signals.
 SENSOR_COLUMNS = ["accX", "accY", "accZ"]
-VALID_LABELS = ["healthy", "imbalance", "obstruction"]
+
+
+
+
+# =========================================================
+# CLI ARGUMENTS
+# =========================================================
+
+def parse_args():
+    """
+    Parse command-line arguments.
+
+    
+    Supports:
+        --mode mock
+        --mode real
+
+    mock:
+        Input  = windows/
+        Output = fft_windows/
+        Report = fft_report.csv
+
+    real:
+        Input  = real_windows/
+        Output = real_fft_windows/
+        Report = real_fft_report.csv
+    """
+    parser = argparse.ArgumentParser(
+        description="FFT processor for mock or real vibration window data."
+    )
+
+    parser.add_argument(
+        "--mode",
+        choices=["mock", "real"],
+        default="mock",
+        help="Pipeline mode. Use 'mock' for regression test data or 'real' for real MPU6050 data.",
+    )
+
+    return parser.parse_args()
 
 
 # =========================================================
@@ -29,12 +71,21 @@ VALID_LABELS = ["healthy", "imbalance", "obstruction"]
 # =========================================================
 
 def validate_config():
-    if EXPECTED_FS != 200:
-        raise ValueError(f"Invalid sampling rate: {EXPECTED_FS}, expected 200 Hz")
+    """
+    Validate core FFT configuration before processing files.
 
-    if EXPECTED_WINDOW_SIZE != 256:
+    
+    Values now come from config.py instead of local hard-coded constants.
+    """
+
+    if SAMPLING_RATE_HZ != 200:
         raise ValueError(
-            f"Invalid window size: {EXPECTED_WINDOW_SIZE}, expected 256 samples"
+            f"Invalid sampling rate: {SAMPLING_RATE_HZ}, expected 200 Hz"
+        )
+
+    if WINDOW_SIZE != 256:
+        raise ValueError(
+            f"Invalid window size: {WINDOW_SIZE}, expected 256 samples"
         )
 
     if EXPECTED_FFT_BINS != 129:
@@ -42,9 +93,36 @@ def validate_config():
             f"Invalid FFT bins: {EXPECTED_FFT_BINS}, expected 129"
         )
 
-    if NYQUIST_FREQUENCY_HZ != 100:
+    if EXPECTED_FREQ_MAX_HZ != 100:
         raise ValueError(
-            f"Invalid Nyquist frequency: {NYQUIST_FREQUENCY_HZ}, expected 100 Hz"
+            f"Invalid Nyquist frequency: {EXPECTED_FREQ_MAX_HZ}, expected 100 Hz"
+        )
+    if NYQUIST_FREQUENCY_HZ != SAMPLING_RATE_HZ / 2:
+        raise ValueError(
+            f"Invalid Nyquist frequency: {NYQUIST_FREQUENCY_HZ}, expected {SAMPLING_RATE_HZ / 2} Hz"
+        )
+    if FREQ_RESOLUTION_HZ != SAMPLING_RATE_HZ / WINDOW_SIZE:
+        raise ValueError(
+            f"Invalid frequency resolution: {FREQ_RESOLUTION_HZ}, expected {SAMPLING_RATE_HZ / WINDOW_SIZE} Hz/bin"
+         )
+
+
+def validate_mode_paths(paths: dict):
+    """
+    Validate required paths for FFT processing.
+
+
+    This makes missing config keys fail early with a clear message.
+    """
+
+    required_keys = ["windows", "fft_windows", "fft_report"]
+
+    missing_keys = [key for key in required_keys if key not in paths]
+
+    if missing_keys:
+        raise KeyError(
+            f"Missing path config keys: {missing_keys}. "
+            f"Please update MOCK_PATHS/REAL_PATHS in config.py."
         )
 
 
@@ -52,7 +130,7 @@ def validate_config():
 # SIGNAL PREPARATION
 # =========================================================
 
-def compute_fft_features_ready_signal(df):
+def compute_fft_ready_signal(df: pd.DataFrame) -> np.ndarray:
     """
     Convert 3-axis acceleration data into one FFT-ready signal.
 
@@ -60,19 +138,24 @@ def compute_fft_features_ready_signal(df):
     1. Compute vector magnitude from accX, accY, accZ.
     2. Remove DC offset.
     3. Apply Hann window to reduce spectral leakage.
+
+    
+    Function renamed from compute_fft_features_ready_signal()
+    to compute_fft_ready_signal() because this file prepares FFT,
+    not final ML features.
     """
 
     acc_x = df["accX"].values
     acc_y = df["accY"].values
     acc_z = df["accZ"].values
 
-    # Vector magnitude
+    #  Vector magnitude converts 3-axis acceleration into one vibration signal.
     acc_mag = np.sqrt(acc_x**2 + acc_y**2 + acc_z**2)
 
-    # Remove DC offset
+    #  Remove DC offset so static gravity/bias does not dominate FFT.
     acc_mag = acc_mag - np.mean(acc_mag)
 
-    # Apply Hann window
+    #  Apply Hann window to reduce spectral leakage.
     hann_window = np.hanning(len(acc_mag))
     windowed_signal = acc_mag * hann_window
 
@@ -83,9 +166,12 @@ def compute_fft_features_ready_signal(df):
 # FFT COMPUTATION
 # =========================================================
 
-def compute_fft(signal, fs):
+def compute_fft(signal: np.ndarray, fs: int) -> tuple[np.ndarray, np.ndarray]:
     """
     Compute one-sided FFT using rFFT.
+
+    
+    Keeps the original rFFT logic but now receives fs from config.py.
     """
 
     n = len(signal)
@@ -93,6 +179,7 @@ def compute_fft(signal, fs):
     fft_values = np.fft.rfft(signal)
     freqs = np.fft.rfftfreq(n, d=1 / fs)
 
+    #  Normalize magnitude by number of samples.
     magnitude = np.abs(fft_values) / n
 
     return freqs, magnitude
@@ -102,73 +189,88 @@ def compute_fft(signal, fs):
 # WINDOW FILE PROCESSING
 # =========================================================
 
-def process_window_file(file_path, output_dir):
+def process_window_file(file_path: Path, output_dir: Path) -> dict:
+    """
+    Process one window CSV file and export one FFT CSV file.
+
+    
+    Uses pathlib Path objects instead of os.path strings.
+    """
+
     df = pd.read_csv(file_path)
 
-    # Check required columns
+    #  Check required columns before processing.
     missing_cols = [col for col in REQUIRED_COLUMNS if col not in df.columns]
     if missing_cols:
         raise ValueError(f"Missing columns in {file_path}: {missing_cols}")
 
-    # Check window size
-    if len(df) != EXPECTED_WINDOW_SIZE:
+    #  Check expected window size from centralized config.
+    if len(df) != WINDOW_SIZE:
         raise ValueError(
             f"Invalid window size in {file_path}: "
-            f"{len(df)} samples, expected {EXPECTED_WINDOW_SIZE}"
+            f"{len(df)} samples, expected {WINDOW_SIZE}"
         )
 
-    # Check label consistency
+    #  Each window must belong to exactly one label.
     if df["label"].nunique() != 1:
         raise ValueError(f"Mixed labels detected in {file_path}")
 
     label = df["label"].iloc[0]
 
-    # Check valid label
-    if label not in VALID_LABELS:
+    #  Validate label using centralized class list from config.py.
+    if label not in CLASS_LABELS:
         raise ValueError(f"Invalid label '{label}' in file: {file_path}")
 
-    # Convert sensor columns to numeric
+    #  Convert sensor columns to numeric and fail fast if invalid.
     for col in SENSOR_COLUMNS:
         df[col] = pd.to_numeric(df[col], errors="raise")
 
-    base_name = os.path.splitext(os.path.basename(file_path))[0]
+    signal = compute_fft_ready_signal(df)
+    freqs, magnitude = compute_fft(signal, SAMPLING_RATE_HZ)
 
-    signal = compute_fft_features_ready_signal(df)
-    freqs, magnitude = compute_fft(signal, EXPECTED_FS)
-
-    # Check FFT output shape
+    #  Check FFT output bins using centralized config.
     if len(freqs) != EXPECTED_FFT_BINS:
         raise ValueError(
             f"Invalid FFT bins in {file_path}: "
             f"{len(freqs)} bins, expected {EXPECTED_FFT_BINS}"
         )
 
-    os.makedirs(output_dir, exist_ok=True)
+    #  Check max frequency against EXPECTED_FREQ_MAX_HZ from config.py.
+    if not np.isclose(freqs[-1], EXPECTED_FREQ_MAX_HZ):
+        raise ValueError(
+            f"Invalid max FFT frequency in {file_path}: "
+            f"{freqs[-1]} Hz, expected {EXPECTED_FREQ_MAX_HZ} Hz"
+        )
 
-    output_name = f"{base_name}_fft.csv"
-    output_path = os.path.join(output_dir, output_name)
+    #  Ensure output label folder exists.
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    fft_df = pd.DataFrame({
-        "frequency_hz": freqs,
-        "magnitude": magnitude,
-        "label": label
-    })
+    output_name = f"{file_path.stem}_fft.csv"
+    output_path = output_dir / output_name
+
+    fft_df = pd.DataFrame(
+        {
+            "frequency_hz": freqs,
+            "magnitude": magnitude,
+            "label": label,
+        }
+    )
 
     fft_df.to_csv(output_path, index=False)
 
     return {
-        "source_window": file_path,
+        "source_window": str(file_path),
         "label": label,
-        "fft_file": output_path,
+        "fft_file": str(output_path),
 
         "num_samples": len(df),
-        "expected_window_size": EXPECTED_WINDOW_SIZE,
+        "expected_window_size": WINDOW_SIZE,
 
-        "expected_fs": EXPECTED_FS,
+        "expected_fs": SAMPLING_RATE_HZ,
         "num_fft_bins": len(freqs),
         "expected_fft_bins": EXPECTED_FFT_BINS,
 
-        "freq_resolution_hz": EXPECTED_FS / len(df),
+        "freq_resolution_hz": SAMPLING_RATE_HZ / len(df),
         "expected_freq_resolution_hz": FREQ_RESOLUTION_HZ,
 
         "max_frequency_hz": freqs[-1],
@@ -180,7 +282,7 @@ def process_window_file(file_path, output_dir):
         "signal_type": "vector_magnitude",
 
         "status": "OK",
-        "reason": "valid"
+        "reason": "valid",
     }
 
 
@@ -189,58 +291,82 @@ def process_window_file(file_path, output_dir):
 # =========================================================
 
 def main():
+    """
+    Main FFT processing pipeline.
+
+    
+    Pipeline now supports:
+        python src/fft_processor.py --mode mock
+        python src/fft_processor.py --mode real
+    """
+
+    args = parse_args()
+
     validate_config()
+
+    # Load mode-specific paths from config.py.
+    paths = get_paths(args.mode)
+    validate_mode_paths(paths)
+
+    # Resolve paths for selected mode.
+    window_root = Path(paths["windows"])
+    output_root = Path(paths["fft_windows"])
+    report_path = Path(paths["fft_report"])
 
     all_report_rows = []
 
     print("======================================")
     print("FFT PROCESSING STARTED")
     print("======================================")
-    print(f"WINDOW_ROOT              : {WINDOW_ROOT}")
-    print(f"OUTPUT_ROOT              : {OUTPUT_ROOT}")
-    print(f"REPORT_PATH              : {REPORT_PATH}")
+    print(f"Mode                      : {args.mode}")
+    print(f"WINDOW_ROOT               : {window_root}")
+    print(f"OUTPUT_ROOT               : {output_root}")
+    print(f"REPORT_PATH               : {report_path}")
     print("--------------------------------------")
-    print(f"Sampling Rate            : {EXPECTED_FS} Hz")
-    print(f"Expected Window Size     : {EXPECTED_WINDOW_SIZE} samples")
-    print(f"Expected FFT Bins        : {EXPECTED_FFT_BINS}")
-    print(f"Nyquist Frequency        : {NYQUIST_FREQUENCY_HZ} Hz")
-    print(f"Frequency Resolution     : {FREQ_RESOLUTION_HZ} Hz/bin")
+    print(f"Sampling Rate             : {SAMPLING_RATE_HZ} Hz")
+    print(f"Expected Window Size      : {WINDOW_SIZE} samples")
+    print(f"Expected FFT Bins         : {EXPECTED_FFT_BINS}")
+    print(f"Nyquist Frequency         : {NYQUIST_FREQUENCY_HZ} Hz")
+    print(f"Frequency Resolution      : {FREQ_RESOLUTION_HZ} Hz/bin")
     print("======================================")
 
-    if not os.path.exists(WINDOW_ROOT):
-        print("ERROR: WINDOW_ROOT does not exist.")
+    # Fail clearly if input folder does not exist.
+    # For real mode, this is expected until real window data is available.
+    if not window_root.exists():
+        print(f"ERROR: Input window folder does not exist: {window_root}")
+        print("Hint: Run windowing first or check mode-specific paths in config.py.")
         return
 
-    os.makedirs(OUTPUT_ROOT, exist_ok=True)
+    #  Create FFT output root folder if missing.
+    output_root.mkdir(parents=True, exist_ok=True)
 
-    for label in sorted(os.listdir(WINDOW_ROOT)):
-        label_dir = os.path.join(WINDOW_ROOT, label)
+    # Process only known class label folders in predictable order.
+    for label in CLASS_LABELS:
+        label_dir = window_root / label
 
-        if not os.path.isdir(label_dir):
+        if not label_dir.exists():
+            print("--------------------------------------")
+            print(f"[SKIP] Missing label folder: {label_dir}")
             continue
 
-        if label not in VALID_LABELS:
-            print(f"[SKIP] Unknown label folder: {label}")
+        if not label_dir.is_dir():
+            print("--------------------------------------")
+            print(f"[SKIP] Not a directory: {label_dir}")
             continue
 
-        output_dir = os.path.join(OUTPUT_ROOT, label)
-        os.makedirs(output_dir, exist_ok=True)
+        output_dir = output_root / label
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-        csv_files = sorted([
-            f for f in os.listdir(label_dir)
-            if f.endswith(".csv")
-        ])
+        csv_files = sorted(label_dir.glob("*.csv"))
 
         print("--------------------------------------")
-        print(f"Processing label       : {label}")
-        print(f"Window files found     : {len(csv_files)}")
+        print(f"Processing label          : {label}")
+        print(f"Window files found        : {len(csv_files)}")
 
         created_count = 0
         failed_count = 0
 
-        for filename in csv_files:
-            file_path = os.path.join(label_dir, filename)
-
+        for file_path in csv_files:
             try:
                 row = process_window_file(file_path, output_dir)
                 all_report_rows.append(row)
@@ -248,28 +374,32 @@ def main():
 
             except Exception as e:
                 failed_count += 1
-                all_report_rows.append({
-                    "source_window": file_path,
-                    "label": label,
-                    "fft_file": None,
-                    "num_samples": None,
-                    "expected_window_size": EXPECTED_WINDOW_SIZE,
-                    "expected_fs": EXPECTED_FS,
-                    "num_fft_bins": None,
-                    "expected_fft_bins": EXPECTED_FFT_BINS,
-                    "freq_resolution_hz": None,
-                    "expected_freq_resolution_hz": FREQ_RESOLUTION_HZ,
-                    "max_frequency_hz": None,
-                    "nyquist_frequency_hz": NYQUIST_FREQUENCY_HZ,
-                    "dc_removed": True,
-                    "window_function": "hann",
-                    "fft_type": "rfft",
-                    "signal_type": "vector_magnitude",
-                    "status": "FAIL",
-                    "reason": str(e)
-                })
 
-                print(f"[FAIL] {filename}: {e}")
+                #  Failed files are still logged into the report for traceability.
+                all_report_rows.append(
+                    {
+                        "source_window": str(file_path),
+                        "label": label,
+                        "fft_file": None,
+                        "num_samples": None,
+                        "expected_window_size": WINDOW_SIZE,
+                        "expected_fs": SAMPLING_RATE_HZ,
+                        "num_fft_bins": None,
+                        "expected_fft_bins": EXPECTED_FFT_BINS,
+                        "freq_resolution_hz": None,
+                        "expected_freq_resolution_hz": FREQ_RESOLUTION_HZ,
+                        "max_frequency_hz": None,
+                        "nyquist_frequency_hz": NYQUIST_FREQUENCY_HZ,
+                        "dc_removed": True,
+                        "window_function": "hann",
+                        "fft_type": "rfft",
+                        "signal_type": "vector_magnitude",
+                        "status": "FAIL",
+                        "reason": str(e),
+                    }
+                )
+
+                print(f"[FAIL] {file_path.name}: {e}")
 
         print(f"FFT files created for {label}: {created_count}")
         print(f"FFT files failed  for {label}: {failed_count}")
@@ -280,12 +410,15 @@ def main():
 
     report_df = pd.DataFrame(all_report_rows)
 
-    report_df.to_csv(REPORT_PATH, index=False)
+    #  Ensure report parent folder exists before saving.
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+
+    report_df.to_csv(report_path, index=False)
 
     print("\n======================================")
     print("FFT PROCESSING COMPLETED")
     print("======================================")
-    print(f"Report saved to: {REPORT_PATH}")
+    print(f"Report saved to: {report_path}")
     print("--------------------------------------")
     print("FFT status by label:")
     print(report_df.groupby(["label", "status"]).size())

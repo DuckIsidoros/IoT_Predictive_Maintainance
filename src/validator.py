@@ -1,40 +1,167 @@
-import os
-import pandas as pd
+import argparse
+import shutil
+from pathlib import Path
+
 import numpy as np
+import pandas as pd
 
-# =========================
-# CONFIG
-# =========================
-
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CLEAN_DATA_DIR = os.path.join(BASE_DIR, "mock_raw_sensor_stream")
-CORRUPTED_DATA_DIR = os.path.join(BASE_DIR, "corrupted_data")
-REPORT_DIR = os.path.join(BASE_DIR, "qc_reports")
-REPORT_FILE = os.path.join(REPORT_DIR, "qc_report.csv")
-
-EXPECTED_FS = 200  # Hz
-EXPECTED_DT_MS = 1000 / EXPECTED_FS  # 5 ms
-
-MIN_DT_MS = EXPECTED_DT_MS * 0.5      # 2.5 ms
-MAX_DT_MS = EXPECTED_DT_MS * 1.5      # 7.5 ms
-GAP_THRESHOLD_MS = EXPECTED_DT_MS * 3 # 15 ms
-
-MAX_JITTER_RATIO = 0.10               # 10%
-MAX_FS_ERROR_RATIO = 0.05             # 5%
-
-REQUIRED_COLUMNS = ["timestamp_ms", "accX", "accY", "accZ", "label"]
+from config import (
+    SAMPLING_RATE_HZ,
+    EXPECTED_DT_MS,
+    CLASS_LABELS,
+    get_paths,
+)
 
 
-# =========================
+# =========================================================
+# VALIDATION CONFIG
+# =========================================================
+
+REQUIRED_COLUMNS = ["timestamp_ms", "accX", "accY", "accZ"]
+
+OPTIONAL_LABEL_COLUMN = "label"
+
+MIN_DT_MS = EXPECTED_DT_MS * 0.5
+MAX_DT_MS = EXPECTED_DT_MS * 1.5
+GAP_THRESHOLD_MS = EXPECTED_DT_MS * 3
+
+MAX_JITTER_RATIO_WARNING = 0.10
+MAX_JITTER_RATIO_FAIL = 0.20
+
+MAX_FS_ERROR_RATIO_WARNING = 0.05
+MAX_FS_ERROR_RATIO_FAIL = 0.10
+
+MAX_ABS_ACCEL_VALUE = 1000.0
+
+
+# =========================================================
+# ARGUMENT PARSING
+# =========================================================
+
+def parse_args():
+    """
+    Parse command-line arguments for validation mode selection.
+    """
+
+    parser = argparse.ArgumentParser(
+        description="Validate raw sensor CSV files for mock or real pipeline."
+    )
+
+    parser.add_argument(
+        "--mode",
+        choices=["mock", "real"],
+        default="mock",
+        help="Pipeline mode. Use 'mock' for generated data or 'real' for incoming real sensor data.",
+    )
+
+    parser.add_argument(
+        "--move-real-files",
+        action="store_true",
+        help="Move real files from incoming to accepted/rejected based on validation status.",
+    )
+
+    parser.add_argument(
+        "--accept-warnings",
+        action="store_true",
+        help="Allow real files with WARNING status to be moved to accepted. By default, only PASS is accepted.",
+    )
+
+    return parser.parse_args()
+
+
+# =========================================================
+# UTILITY FUNCTIONS
+# =========================================================
+
+def add_reason(result, severity, reason):
+    """
+    Add a validation reason and update final status.
+
+    Severity:
+        PASS does not downgrade status.
+        WARNING downgrades PASS to WARNING.
+        FAIL overrides all other statuses.
+    """
+
+    result["reasons"].append(reason)
+
+    if severity == "FAIL":
+        result["status"] = "FAIL"
+    elif severity == "WARNING" and result["status"] == "PASS":
+        result["status"] = "WARNING"
+
+
+def infer_label_from_filename(file_path):
+    """
+    Infer label from filename when label column is not available.
+
+    Example:
+        fan01_healthy_session001.csv -> healthy
+    """
+
+    filename = Path(file_path).stem.lower()
+
+    matched_labels = [
+        label for label in CLASS_LABELS
+        if label.lower() in filename
+    ]
+
+    if len(matched_labels) == 1:
+        return matched_labels[0]
+
+    return None
+
+
+def safe_numeric_series(df, column_name):
+    """
+    Convert one dataframe column to numeric values.
+    Invalid values become NaN and will be counted later.
+    """
+
+    return pd.to_numeric(df[column_name], errors="coerce")
+
+
+def has_duplicated_header_rows(df):
+    """
+    Detect duplicated CSV header rows inside the data body.
+    """
+
+    if df.empty:
+        return False
+
+    for col in df.columns:
+        if df[col].astype(str).str.strip().eq(col).any():
+            return True
+
+    return False
+
+
+# =========================================================
 # VALIDATION FUNCTION
-# =========================
+# =========================================================
 
-def validate_file(file_path, expected_status=None):
+def validate_file(file_path, expected_status=None, mode="mock"):
+    """
+    Validate one raw sensor CSV file.
+
+    For mock mode:
+        The function validates clean and corrupted test files.
+
+    For real mode:
+        The function validates incoming real data before it can be accepted.
+    """
+
+    file_path = Path(file_path)
+
     result = {
-        "file": file_path,
+        "file": str(file_path),
+        "filename": file_path.name,
+        "mode": mode,
         "expected_status": expected_status,
         "status": "PASS",
         "reasons": [],
+        "label_source": None,
+        "label": None,
         "total_samples": 0,
         "mean_dt_ms": None,
         "std_dt_ms": None,
@@ -44,44 +171,106 @@ def validate_file(file_path, expected_status=None):
         "fs_error_ratio": None,
         "jitter_ratio": None,
         "num_non_increasing_ts": 0,
+        "num_duplicate_timestamps": 0,
         "num_bad_dt": 0,
         "num_large_gaps": 0,
         "estimated_missing_samples": 0,
         "num_nan_rows": 0,
+        "num_inf_rows": 0,
+        "num_extreme_sensor_rows": 0,
+        "decision": None,
     }
+
+    if file_path.suffix.lower() != ".csv":
+        add_reason(result, "FAIL", "not_csv_file")
+        result["decision"] = result["status"]
+        return result
 
     try:
         df = pd.read_csv(file_path)
-    except Exception as e:
-        result["status"] = "FAIL"
-        result["reasons"].append(f"cannot_read_file: {e}")
+    except Exception as exc:
+        add_reason(result, "FAIL", f"cannot_read_file: {exc}")
+        result["decision"] = result["status"]
         return result
 
     result["total_samples"] = len(df)
 
-    # 1. Check columns
-    missing_cols = [col for col in REQUIRED_COLUMNS if col not in df.columns]
-    if missing_cols:
-        result["status"] = "FAIL"
-        result["reasons"].append(f"missing_columns: {missing_cols}")
+    if len(df) == 0:
+        add_reason(result, "FAIL", "empty_file")
+        result["decision"] = result["status"]
         return result
 
-    # 2. Check NaN
-    nan_rows = df[REQUIRED_COLUMNS].isna().any(axis=1).sum()
+    if has_duplicated_header_rows(df):
+        add_reason(result, "FAIL", "duplicated_header_rows_detected")
+
+    missing_cols = [col for col in REQUIRED_COLUMNS if col not in df.columns]
+    if missing_cols:
+        add_reason(result, "FAIL", f"missing_required_columns: {missing_cols}")
+        result["decision"] = result["status"]
+        return result
+
+    if OPTIONAL_LABEL_COLUMN in df.columns:
+        unique_labels = df[OPTIONAL_LABEL_COLUMN].dropna().astype(str).str.strip().unique()
+
+        if len(unique_labels) == 1:
+            label = unique_labels[0]
+            result["label"] = label
+            result["label_source"] = "column"
+        elif len(unique_labels) == 0:
+            label = infer_label_from_filename(file_path)
+            result["label"] = label
+            result["label_source"] = "filename"
+            if mode =="real":
+                add_reason(result, "FAIL", "missing_label_column_and_cannot_infer_from_filename")
+            else:
+                add_reason(result, "WARNING", "label_column_empty_using_filename")
+        else:
+            add_reason(result, "FAIL", "mixed_labels_in_file")
+            result["label"] = ";".join(unique_labels)
+            result["label_source"] = "column"
+    else:
+        label = infer_label_from_filename(file_path)
+        result["label"] = label
+        result["label_source"] = "filename"
+
+        if mode == "real":
+            add_reason(result, "FAIL", "missing_label_column")
+        else:
+            add_reason(result, "FAIL", "missing_label_column")
+
+    if result["label"] not in CLASS_LABELS:
+        add_reason(result, "FAIL", f"invalid_or_missing_label: {result['label']}")
+
+    if len(df) < 2:
+        add_reason(result, "FAIL", "not_enough_samples")
+        result["decision"] = result["status"]
+        return result
+
+    numeric_columns = ["timestamp_ms", "accX", "accY", "accZ"]
+
+    for column in numeric_columns:
+        df[column] = safe_numeric_series(df, column)
+
+    nan_rows = df[numeric_columns].isna().any(axis=1).sum()
     result["num_nan_rows"] = int(nan_rows)
 
     if nan_rows > 0:
-        result["status"] = "FAIL"
-        result["reasons"].append("nan_values_detected")
+        add_reason(result, "FAIL", "nan_or_non_numeric_values_detected")
 
-    # 3. Check minimum samples
-    if len(df) < 2:
-        result["status"] = "FAIL"
-        result["reasons"].append("not_enough_samples")
-        return result
+    inf_rows = np.isinf(df[numeric_columns].to_numpy(dtype=float)).any(axis=1).sum()
+    result["num_inf_rows"] = int(inf_rows)
 
-    # 4. Compute dt
-    timestamp = df["timestamp_ms"].astype(float)
+    if inf_rows > 0:
+        add_reason(result, "FAIL", "inf_values_detected")
+
+    sensor_abs_max = df[["accX", "accY", "accZ"]].abs().max(axis=1)
+    extreme_rows = (sensor_abs_max > MAX_ABS_ACCEL_VALUE).sum()
+    result["num_extreme_sensor_rows"] = int(extreme_rows)
+
+    if extreme_rows > 0:
+        add_reason(result, "WARNING", "extreme_sensor_values_detected")
+
+    timestamp = df["timestamp_ms"]
     dt = timestamp.diff().dropna()
 
     mean_dt = dt.mean()
@@ -94,133 +283,275 @@ def validate_file(file_path, expected_status=None):
     result["min_dt_ms"] = min_dt
     result["max_dt_ms"] = max_dt
 
-    # 5. Non-increasing timestamp
     non_increasing = (dt <= 0).sum()
     result["num_non_increasing_ts"] = int(non_increasing)
 
     if non_increasing > 0:
-        result["status"] = "FAIL"
-        result["reasons"].append("non_increasing_timestamp")
+        add_reason(result, "FAIL", "non_increasing_timestamp")
 
-    # 6. Bad dt: sampling interval too small or too large
+    duplicate_timestamps = timestamp.duplicated().sum()
+    result["num_duplicate_timestamps"] = int(duplicate_timestamps)
+
+    if duplicate_timestamps > 0:
+        add_reason(result, "FAIL", "duplicate_timestamps")
+
     bad_dt = ((dt < MIN_DT_MS) | (dt > MAX_DT_MS)).sum()
     result["num_bad_dt"] = int(bad_dt)
 
     if bad_dt > 0:
-        result["status"] = "FAIL"
-        result["reasons"].append("inconsistent_sampling_interval")
+        add_reason(result, "FAIL", "inconsistent_sampling_interval")
 
-    # 7. Large gaps / missing chunks
     large_gaps = dt[dt > GAP_THRESHOLD_MS]
     result["num_large_gaps"] = int(len(large_gaps))
 
     if len(large_gaps) > 0:
-        result["status"] = "FAIL"
-        result["reasons"].append("large_timestamp_gap")
+        add_reason(result, "FAIL", "large_timestamp_gap")
 
         estimated_missing = ((large_gaps / EXPECTED_DT_MS).round() - 1).sum()
         result["estimated_missing_samples"] = int(max(0, estimated_missing))
 
-    # 8. Effective sampling rate
-    if mean_dt > 0:
+    if mean_dt and mean_dt > 0:
         effective_fs = 1000 / mean_dt
-        fs_error_ratio = abs(effective_fs - EXPECTED_FS) / EXPECTED_FS
+        fs_error_ratio = abs(effective_fs - SAMPLING_RATE_HZ) / SAMPLING_RATE_HZ
 
         result["effective_fs"] = effective_fs
         result["fs_error_ratio"] = fs_error_ratio
 
-        if fs_error_ratio > MAX_FS_ERROR_RATIO:
-            result["status"] = "FAIL"
-            result["reasons"].append("effective_sampling_rate_deviation")
+        if fs_error_ratio > MAX_FS_ERROR_RATIO_FAIL:
+            add_reason(result, "FAIL", "effective_sampling_rate_deviation_fail")
+        elif fs_error_ratio > MAX_FS_ERROR_RATIO_WARNING:
+            add_reason(result, "WARNING", "effective_sampling_rate_deviation_warning")
 
-    # 9. Jitter ratio
-    if mean_dt > 0:
-        jitter_ratio = std_dt / mean_dt
+    if mean_dt and mean_dt > 0:
+        jitter_ratio = std_dt / mean_dt if pd.notna(std_dt) else 0.0
         result["jitter_ratio"] = jitter_ratio
 
-        if jitter_ratio > MAX_JITTER_RATIO:
-            result["status"] = "FAIL"
-            result["reasons"].append("high_sampling_jitter")
+        if jitter_ratio > MAX_JITTER_RATIO_FAIL:
+            add_reason(result, "FAIL", "high_sampling_jitter_fail")
+        elif jitter_ratio > MAX_JITTER_RATIO_WARNING:
+            add_reason(result, "WARNING", "high_sampling_jitter_warning")
 
     if len(result["reasons"]) == 0:
         result["reasons"] = ["ok"]
 
+    result["decision"] = result["status"]
+
     return result
 
 
-# =========================
+# =========================================================
 # FILE COLLECTION
-# =========================
+# =========================================================
 
-def collect_csv_files():
+def collect_mock_files(paths):
+    """
+    Collect mock clean and corrupted CSV files.
+
+    Clean mock files are expected to PASS.
+    Corrupted mock files are expected to FAIL.
+    """
+
     files = []
 
-    # Clean data: expected PASS
-    for root, _, filenames in os.walk(CLEAN_DATA_DIR):
-        for filename in filenames:
-            if filename.endswith(".csv"):
-                files.append((os.path.join(root, filename), "PASS"))
+    clean_dir = paths["raw"]
+    corrupted_dir = paths["corrupted"]
 
-    # Corrupted data: expected FAIL
-    for root, _, filenames in os.walk(CORRUPTED_DATA_DIR):
-        for filename in filenames:
-            if filename.endswith(".csv"):
-                files.append((os.path.join(root, filename), "FAIL"))
+    for label in CLASS_LABELS:
+        class_dir = clean_dir / label
+
+        if not class_dir.exists():
+            continue
+
+        for file_path in sorted(class_dir.glob("*.csv")):
+            files.append((file_path, "PASS"))
+
+    if corrupted_dir.exists():
+        for file_path in sorted(corrupted_dir.rglob("*.csv")):
+            files.append((file_path, "FAIL"))
 
     return files
 
 
-# =========================
-# MAIN
-# =========================
+def collect_real_files(paths):
+    """
+    Collect real incoming CSV files.
 
-def main():
-    os.makedirs(REPORT_DIR, exist_ok=True)
+    Real files do not have expected status because they are unknown before validation.
+    """
 
-    files = collect_csv_files()
+    incoming_dir = paths["incoming"]
+
+    files = []
+
+    if not incoming_dir.exists():
+        return files
+
+    for file_path in sorted(incoming_dir.iterdir()):
+        if file_path.is_file():
+            files.append((file_path, None))
+
+    return files
+
+
+# =========================================================
+# REAL FILE ROUTING
+# =========================================================
+
+def route_real_file(file_path, status, paths, accept_warnings=False):
+    """
+    Move real files from incoming to accepted or rejected folder.
+
+    PASS files are accepted.
+    WARNING files are rejected unless --accept-warnings is specified.
+    """
+
+    file_path = Path(file_path)
+
+    should_accept = status == "PASS" or (status == "WARNING" and accept_warnings)
+
+    if should_accept:
+        target_dir = paths["raw"]
+    else:
+        target_dir = paths["rejected"]
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    target_path = target_dir / file_path.name
+
+    if target_path.exists():
+        target_path = target_dir / f"{file_path.stem}_validated{file_path.suffix}"
+
+    shutil.move(str(file_path), str(target_path))
+
+    return target_path
+
+# =========================================================
+# REPORTING
+# =========================================================
+
+def save_report(results, report_file):
+    """
+    Save validation results into a CSV report.
+    """
+
+    report_file = Path(report_file)
+    report_file.parent.mkdir(parents=True, exist_ok=True)
+
+    report_df = pd.DataFrame(results)
+    report_df["reasons"] = report_df["reasons"].apply(
+        lambda reasons: ";".join(reasons)
+    )
+
+    report_df.to_csv(report_file, index=False)
+
+    return report_df
+
+
+def print_summary(report_df, mode):
+    """
+    Print validation summary to console.
+    """
+
+    print("--------------------------------------")
+    print("Validation completed.")
+    print(f"Mode: {mode}")
+    print("--------------------------------------")
+    print(f"Total files : {len(report_df)}")
+    print(f"PASS        : {(report_df['status'] == 'PASS').sum()}")
+    print(f"WARNING     : {(report_df['status'] == 'WARNING').sum()}")
+    print(f"FAIL        : {(report_df['status'] == 'FAIL').sum()}")
+
+    if "expected_status" in report_df.columns and report_df["expected_status"].notna().any():
+        mismatch = (
+            report_df["expected_status"].notna()
+            & (report_df["status"] != report_df["expected_status"])
+        ).sum()
+        print(f"Mismatch    : {mismatch}")
+
+
+# =========================================================
+# MAIN PIPELINE
+# =========================================================
+
+def run_validation(mode, move_real_files=False, accept_warnings=False):
+    """
+    Run validation pipeline for mock or real mode.
+    """
+
+    paths = get_paths(mode)
+
+    if mode == "mock":
+        files = collect_mock_files(paths)
+        report_file = paths["qc_reports"] / "qc_report.csv"
+    else:
+        files = collect_real_files(paths)
+        report_file = paths["qc_reports"] / "real_validation_report.csv"
 
     if not files:
-        print("No CSV files found.")
+        print(f"No files found for mode={mode}.")
         return
+
+    print("======================================")
+    print("VALIDATION PIPELINE STARTED")
+    print("======================================")
+    print(f"Mode             : {mode}")
+    print(f"Expected dt      : {EXPECTED_DT_MS:.3f} ms")
+    print(f"Expected fs      : {SAMPLING_RATE_HZ} Hz")
+    print(f"Report file      : {report_file}")
+    print(f"Move real files  : {move_real_files}")
+    print(f"Accept warnings   : {accept_warnings}")
+    print("======================================")
 
     results = []
 
-    print("Starting validation...")
-    print(f"Expected dt: {EXPECTED_DT_MS:.3f} ms")
-    print("--------------------------------------")
-
     for file_path, expected_status in files:
-        result = validate_file(file_path, expected_status)
-        results.append(result)
-
-        check = "OK" if result["status"] == expected_status else "MISMATCH"
-
-        print(
-            f"[{check}] {result['status']} | expected={expected_status} | {file_path}"
+        result = validate_file(
+            file_path=file_path,
+            expected_status=expected_status,
+            mode=mode,
         )
 
-        if result["status"] == "FAIL":
-            print(f"     reasons: {result['reasons']}")
+        if mode == "real" and move_real_files:
+            routed_path = route_real_file(
+                file_path=file_path,
+                status=result["status"],
+                paths=paths,
+                accept_warnings=accept_warnings,
+            )
+            result["routed_to"] = str(routed_path)
+        else:
+            result["routed_to"] = None
 
-    report_df = pd.DataFrame(results)
-    report_df["reasons"] = report_df["reasons"].apply(lambda x: ";".join(x))
+        results.append(result)
 
-    report_df.to_csv(REPORT_FILE, index=False)
+        if expected_status:
+            check = "OK" if result["status"] == expected_status else "MISMATCH"
+            print(
+                f"[{check}] {result['status']} | expected={expected_status} | {file_path}"
+            )
+        else:
+            print(f"[{result['status']}] {file_path}")
 
-    print("--------------------------------------")
-    print(f"Validation completed.")
-    print(f"Report saved to: {REPORT_FILE}")
+        if result["status"] in ["WARNING", "FAIL"]:
+            print(f"reasons: {result['reasons']}")
 
-    total = len(report_df)
-    passed = (report_df["status"] == "PASS").sum()
-    failed = (report_df["status"] == "FAIL").sum()
-    mismatch = (report_df["status"] != report_df["expected_status"]).sum()
+    report_df = save_report(results, report_file)
 
-    print("--------------------------------------")
-    print(f"Total files : {total}")
-    print(f"PASS        : {passed}")
-    print(f"FAIL        : {failed}")
-    print(f"Mismatch    : {mismatch}")
+    print(f"Report saved to: {report_file}")
+    print_summary(report_df, mode)
+
+
+def main():
+    """
+    Entry point for command-line execution.
+    """
+
+    args = parse_args()
+    run_validation(
+        mode=args.mode,
+        move_real_files=args.move_real_files,
+        accept_warnings=args.accept_warnings,
+    )
 
 
 if __name__ == "__main__":

@@ -6,3 +6,24 @@ dist/
 wheels/
 *.egg-info
 env
+# Generated pipeline outputs
+mock_raw_sensor_stream/
+corrupted_data/
+qc_reports/
+segments/
+windows/
+fft_windows/
+features/
+
+real_raw_sensor_stream/
+real_qc_reports/
+real_segments/
+real_windows/
+real_fft_windows/
+real_features/
+
+*_report.csv
+
+# Python cache
+__pycache__/
+*.pyc
