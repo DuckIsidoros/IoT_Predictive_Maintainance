@@ -66,14 +66,14 @@ export default function Home() {
 
 
   const getConfidenceColor = (confidence: number) => {
-    if (confidence > 0.7) return "text-red-600";
+    if (confidence > 0.7) return "text-green-600";
     if (confidence > 0.4) return "text-yellow-600";
-    return "text-green-600";
+    return "text-red-600";
   };
 
   
   const getStatusColor = (status: string) => {
-    if (status === "OK" || status === "Running" || status === "Connected") return "bg-green-100 text-green-800";
+    if (status === "OK" || status === "Running" || status === "Connected") return "text-green-800";
     if (status === "Warning") return "bg-yellow-100 text-yellow-800";
     return "bg-red-100 text-red-800";
   };
@@ -95,11 +95,11 @@ export default function Home() {
       {/* Header */}
       <header className="flex items-center justify-between mb-8">
         <div>
-          <h1 className="text-3xl font-bold">🔧 IoT Predictive Maintenance</h1>
-          <p className="text-sm text-gray-400">Live Sensor & Inference Dashboard</p>
+          <h1 className="text-3xl font-bold">IoT Predictive Maintenance</h1>
+          <p className="text-sm text-gray-400">Sensor & Inference Dashboard</p>
         </div>
         <div className="flex gap-4">
-          <div className={`px-4 py-2 rounded-lg font-semibold ${connected ? "bg-green-600" : "bg-red-600"}`}>
+          <div className={`px-4 py-2 rounded-lg font-semibold`}>
             {connected ? "🟢 Connected" : "🔴 Disconnected"}
           </div>
           <div className="text-sm text-gray-400">{data.timestamp}</div>
@@ -128,42 +128,31 @@ export default function Home() {
         </div>
       </section>
 
-      {/* Raw Acceleration Data */}
       <section className="bg-slate-700 rounded-lg p-6 mb-8">
-        <h2 className="text-2xl font-bold mb-4">📊 Raw Acceleration</h2>
-        <div className="grid grid-cols-3 gap-4">
-          <div>
-            <div className="text-sm text-gray-400">Ax (X-axis)</div>
-            <div className="text-lg font-mono bg-slate-800 rounded p-2 mt-2">
-              {data.raw.ax.map((v, i) => (
+      <h2 className="text-2xl font-bold mb-4">Raw Acceleration</h2>
+      <div className="grid grid-cols-3 gap-4">
+        {[
+          { label: 'Ax (X-axis)', values: data.raw.ax },
+          { label: 'Ay (Y-axis)', values: data.raw.ay },
+          { label: 'Az (Z-axis)', values: data.raw.az },
+        ].map((axis) => (
+          <div key={axis.label}>
+            <div className="text-sm text-gray-400">{axis.label}</div>
+            <div className="text-lg font-mono bg-slate-800 rounded p-2 mt-2 h-48 overflow-y-auto">
+              {axis.values.map((v, i) => (
                 <div key={i}>{v.toFixed(3)} g</div>
               ))}
             </div>
           </div>
-          <div>
-            <div className="text-sm text-gray-400">Ay (Y-axis)</div>
-            <div className="text-lg font-mono bg-slate-800 rounded p-2 mt-2">
-              {data.raw.ay.map((v, i) => (
-                <div key={i}>{v.toFixed(3)} g</div>
-              ))}
-            </div>
-          </div>
-          <div>
-            <div className="text-sm text-gray-400">Az (Z-axis)</div>
-            <div className="text-lg font-mono bg-slate-800 rounded p-2 mt-2">
-              {data.raw.az.map((v, i) => (
-                <div key={i}>{v.toFixed(3)} g</div>
-              ))}
-            </div>
-          </div>
-        </div>
-      </section>
+        ))}
+      </div>
+    </section>
 
       {/* Features Section */}
       <section className="grid grid-cols-2 gap-8 mb-8">
         {/* RMS & Band Power */}
         <div className="bg-slate-700 rounded-lg p-6">
-          <h2 className="text-2xl font-bold mb-4">⚡ Features</h2>
+          <h2 className="text-2xl font-bold mb-4">Features</h2>
           <div className="space-y-4">
             <div className="bg-slate-800 rounded p-4">
               <div className="text-sm text-gray-400">RMS (Root Mean Square)</div>
@@ -208,7 +197,7 @@ export default function Home() {
 
         {/* FFT Data with Recharts */}
         <div className="bg-slate-700 rounded-lg p-6">
-          <h2 className="text-2xl font-bold mb-4">🌊 FFT Spectrum</h2>
+          <h2 className="text-2xl font-bold mb-4">FFT Spectrum</h2>
           <ResponsiveContainer width="100%" height={320}>
             <BarChart
               data={fftChartData}
@@ -237,7 +226,7 @@ export default function Home() {
 
       {/* Inference Results */}
       <section className="bg-slate-700 rounded-lg p-6">
-        <h2 className="text-2xl font-bold mb-4">🤖 AI Inference Results</h2>
+        <h2 className="text-2xl font-bold mb-4">AI Inference Results</h2>
         <div className="grid grid-cols-2 gap-8">
           {/* Prediction Card */}
           <div className="bg-slate-800 rounded p-6">
@@ -248,14 +237,16 @@ export default function Home() {
             <div className={`text-lg font-semibold mt-2 ${getConfidenceColor(data.inference.confidence)}`}>
               Confidence: {(data.inference.confidence * 100).toFixed(1)}%
             </div>
+            
+            {/* Progress Bar (Already matches the logic) */}
             <div className="mt-4 bg-slate-900 rounded h-3 overflow-hidden">
               <div
                 className={`h-full transition-all ${
-                  data.inference.confidence > 0.7
-                    ? "bg-red-500"
-                    : data.inference.confidence > 0.4
+                  data.inference.confidence >= 0.7
+                    ? "bg-green-500"
+                    : data.inference.confidence >= 0.4
                     ? "bg-yellow-500"
-                    : "bg-green-500"
+                    : "bg-red-500"
                 }`}
                 style={{ width: `${data.inference.confidence * 100}%` }}
               />
