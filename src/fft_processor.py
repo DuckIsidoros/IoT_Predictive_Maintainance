@@ -132,32 +132,23 @@ def validate_mode_paths(paths: dict):
 
 def compute_fft_ready_signal(df: pd.DataFrame) -> np.ndarray:
     """
-    Convert 3-axis acceleration data into one FFT-ready signal.
+    Prepare accZ signal for FFT.
 
     Steps:
-    1. Compute vector magnitude from accX, accY, accZ.
+    1. Use accZ as the vibration signal for BandPower_Z.
     2. Remove DC offset.
     3. Apply Hann window to reduce spectral leakage.
-
-    
-    Function renamed from compute_fft_features_ready_signal()
-    to compute_fft_ready_signal() because this file prepares FFT,
-    not final ML features.
     """
 
-    acc_x = df["accX"].values
-    acc_y = df["accY"].values
-    acc_z = df["accZ"].values
+    # Use accZ only because BandPower_Z must be computed from Z-axis acceleration.
+    acc_z = df["accZ"].values.astype(float)
 
-    #  Vector magnitude converts 3-axis acceleration into one vibration signal.
-    acc_mag = np.sqrt(acc_x**2 + acc_y**2 + acc_z**2)
+    # Remove DC offset from accZ so static gravity/bias does not dominate FFT.
+    acc_z = acc_z - np.mean(acc_z)
 
-    #  Remove DC offset so static gravity/bias does not dominate FFT.
-    acc_mag = acc_mag - np.mean(acc_mag)
-
-    #  Apply Hann window to reduce spectral leakage.
-    hann_window = np.hanning(len(acc_mag))
-    windowed_signal = acc_mag * hann_window
+    # Apply Hann window to reduce spectral leakage.
+    hann_window = np.hanning(len(acc_z))
+    windowed_signal = acc_z * hann_window
 
     return windowed_signal
 
@@ -225,8 +216,8 @@ def process_window_file(file_path: Path, output_dir: Path) -> dict:
     for col in SENSOR_COLUMNS:
         df[col] = pd.to_numeric(df[col], errors="raise")
 
-    signal = compute_fft_ready_signal(df)
-    freqs, magnitude = compute_fft(signal, SAMPLING_RATE_HZ)
+    signal_z = compute_fft_ready_signal(df)  #  Use accZ as the primary vibration signal for FFT.
+    freqs, magnitude = compute_fft(signal_z, SAMPLING_RATE_HZ)
 
     #  Check FFT output bins using centralized config.
     if len(freqs) != EXPECTED_FFT_BINS:
@@ -279,7 +270,7 @@ def process_window_file(file_path: Path, output_dir: Path) -> dict:
         "dc_removed": True,
         "window_function": "hann",
         "fft_type": "rfft",
-        "signal_type": "vector_magnitude",
+        "signal_type": "accZ",
 
         "status": "OK",
         "reason": "valid",
@@ -393,7 +384,7 @@ def main():
                         "dc_removed": True,
                         "window_function": "hann",
                         "fft_type": "rfft",
-                        "signal_type": "vector_magnitude",
+                        "signal_type": "accZ",
                         "status": "FAIL",
                         "reason": str(e),
                     }

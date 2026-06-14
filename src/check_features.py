@@ -14,6 +14,12 @@ EXPECTED_CLASS_COUNTS = {
 }
 
 FEATURE_COLUMNS = [
+    "RMS_X",
+    "RMS_Y",
+    "RMS_Z",
+    "BandPower_Z_Low",
+    "BandPower_Z_Mid",
+    "BandPower_Z_High",
     "dominant_frequency",
     "max_magnitude",
     "mean_magnitude",
@@ -21,9 +27,6 @@ FEATURE_COLUMNS = [
     "total_energy",
     "spectral_centroid",
     "spectral_bandwidth",
-    "low_band_energy",
-    "mid_band_energy",
-    "high_band_energy",
 ]
 
 
