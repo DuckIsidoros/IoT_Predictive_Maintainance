@@ -1,29 +1,39 @@
-# Python-generated files
+# Python
 __pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
-env
-# Generated pipeline outputs
+*.pyc
+
+# Mock data
 mock_raw_sensor_stream/
-corrupted_data/
-qc_reports/
+
+# Real data
+real_raw_sensor_stream/
+
+# Pipeline outputs
 segments/
 windows/
-fft_windows/
-features/
+vft_windows/
 
-real_raw_sensor_stream/
-real_qc_reports/
+corrupted_data/
+features/
+fft_windows/
+
 real_segments/
 real_windows/
 real_fft_windows/
-real_features/
 
-*_report.csv
+# Reports
+qc_reports/
+real_qc_reports/
 
-# Python cache
-__pycache__/
-*.pyc
+fft_report.csv
+segment_report.csv
+window_report.csv
+features_dataset.csv
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# Virtual env
+.venv/
+venv/
+env/

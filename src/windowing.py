@@ -13,6 +13,7 @@ from config import (
     MAX_WINDOWS_PER_CLASS,
     get_paths,
 )
+from config import EXPECTED_DT_MS
 
 
 # =========================================================
@@ -77,36 +78,92 @@ def validate_config():
             f"Invalid stride: {STEP_SIZE}, expected 128 samples"
         )
 
-    if MAX_WINDOWS_PER_CLASS != 500:
+    if MAX_WINDOWS_PER_CLASS <= 0:
         raise ValueError(
-            f"Invalid max windows per class: {MAX_WINDOWS_PER_CLASS}, expected 500"
+            f"Invalid max windows per class: {MAX_WINDOWS_PER_CLASS}, expected positive integer"
         )
-
 
 def validate_segment_dataframe(df, file_path):
     """
     Validate one segment dataframe before creating windows.
     """
 
+    #  Check required columns first before accessing any column.
     missing_cols = [col for col in REQUIRED_COLUMNS if col not in df.columns]
+
     if missing_cols:
-        raise ValueError(f"Missing columns in {file_path}: {missing_cols}")
-
-    if len(df) == 0:
-        raise ValueError(f"Empty segment file: {file_path}")
-
-    if len(df) < WINDOW_SIZE:
         raise ValueError(
-            f"Segment file has only {len(df)} samples, expected at least {WINDOW_SIZE}: {file_path}"
+            f"Missing columns in {file_path}: {missing_cols}"
         )
 
+    # Reject empty segment early.
+    if len(df) == 0:
+        raise ValueError(
+            f"Empty segment file: {file_path}"
+        )
+
+    # Ensure segment is long enough for one FFT window.
+    if len(df) < WINDOW_SIZE:
+        raise ValueError(
+            f"Segment file has only {len(df)} samples, "
+            f"expected at least {WINDOW_SIZE}: {file_path}"
+        )
+
+    # Convert timestamp to numeric before checking continuity.
+    df["timestamp_ms"] = pd.to_numeric(
+        df["timestamp_ms"],
+        errors="coerce"
+    )
+
+    if df["timestamp_ms"].isna().any():
+        raise ValueError(
+            f"Non-numeric timestamps detected in file: {file_path}"
+        )
+
+    # Validate timestamp continuity.
+    dt = df["timestamp_ms"].diff().dropna()
+
+    if (dt <= 0).any():
+        raise ValueError(
+            f"Non-increasing timestamps detected in file: {file_path}"
+        )
+
+    if (
+        (dt < EXPECTED_DT_MS * 0.5)
+        | (dt > EXPECTED_DT_MS * 1.5)
+    ).any():
+        raise ValueError(
+            f"Unexpected timestamp intervals detected in file: {file_path}"
+        )
+
+    # Convert sensor columns to numeric before windowing.
+    sensor_columns = ["accX", "accY", "accZ"]
+
+    for column in sensor_columns:
+        df[column] = pd.to_numeric(
+            df[column],
+            errors="coerce"
+        )
+
+    if df[sensor_columns].isna().any().any():
+        raise ValueError(
+            f"Non-numeric sensor values detected in file: {file_path}"
+        )
+
+    # Normalize label before checking consistency.
+    df["label"] = df["label"].astype(str).str.lower().str.strip()
+
     if df["label"].nunique() != 1:
-        raise ValueError(f"Mixed labels detected in segment file: {file_path}")
+        raise ValueError(
+            f"Mixed labels detected in segment file: {file_path}"
+        )
 
     label = df["label"].iloc[0]
 
     if label not in CLASS_LABELS:
-        raise ValueError(f"Invalid label '{label}' in file: {file_path}")
+        raise ValueError(
+            f"Invalid label '{label}' in file: {file_path}"
+        )
 
     return label
 
