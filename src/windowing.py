@@ -83,12 +83,21 @@ def validate_config():
             f"Invalid max windows per class: {MAX_WINDOWS_PER_CLASS}, expected positive integer"
         )
 
-def validate_segment_dataframe(df, file_path):
+# [CHANGED] Add mode to support different timestamp policies for mock vs real
+def validate_segment_dataframe(df, file_path, mode):
     """
     Validate one segment dataframe before creating windows.
+
+    Mock mode:
+        Strict timestamp interval validation.
+
+    Real mode:
+        Allow MPU6050 sampling jitter.
+        Still reject rollback, duplicate timestamp, large gaps, NaN,
+        mixed labels, and invalid labels.
     """
 
-    #  Check required columns first before accessing any column.
+    # [FIXED] Check required columns before accessing any column
     missing_cols = [col for col in REQUIRED_COLUMNS if col not in df.columns]
 
     if missing_cols:
@@ -96,20 +105,20 @@ def validate_segment_dataframe(df, file_path):
             f"Missing columns in {file_path}: {missing_cols}"
         )
 
-    # Reject empty segment early.
+    # [FIXED] Reject empty segment early
     if len(df) == 0:
         raise ValueError(
             f"Empty segment file: {file_path}"
         )
 
-    # Ensure segment is long enough for one FFT window.
+    # [FIXED] Ensure segment is long enough for one FFT window
     if len(df) < WINDOW_SIZE:
         raise ValueError(
             f"Segment file has only {len(df)} samples, "
             f"expected at least {WINDOW_SIZE}: {file_path}"
         )
 
-    # Convert timestamp to numeric before checking continuity.
+    # [FIXED] Convert timestamp to numeric before checking continuity
     df["timestamp_ms"] = pd.to_numeric(
         df["timestamp_ms"],
         errors="coerce"
@@ -120,23 +129,49 @@ def validate_segment_dataframe(df, file_path):
             f"Non-numeric timestamps detected in file: {file_path}"
         )
 
-    # Validate timestamp continuity.
+    # [FIXED] Validate timestamp continuity with mode-aware policy
     dt = df["timestamp_ms"].diff().dropna()
 
+    # Always reject rollback or duplicate timestamp
     if (dt <= 0).any():
+        min_dt = dt.min()
         raise ValueError(
-            f"Non-increasing timestamps detected in file: {file_path}"
+            f"Non-increasing timestamps detected in file: {file_path}. "
+            f"min_dt_ms={min_dt}"
         )
 
-    if (
-        (dt < EXPECTED_DT_MS * 0.5)
-        | (dt > EXPECTED_DT_MS * 1.5)
-    ).any():
-        raise ValueError(
-            f"Unexpected timestamp intervals detected in file: {file_path}"
-        )
+    if mode == "real":
+        # [ADDED] Real MPU6050 data can have sampling jitter.
+        # Allow small/medium jitter; reject only large gaps.
+        real_gap_threshold_ms = EXPECTED_DT_MS * 6
 
-    # Convert sensor columns to numeric before windowing.
+        if (dt > real_gap_threshold_ms).any():
+            max_dt = dt.max()
+            raise ValueError(
+                f"Large timestamp gaps detected in file: {file_path}. "
+                f"max_dt_ms={max_dt}, "
+                f"threshold_ms={real_gap_threshold_ms}"
+            )
+
+    else:
+        # [FIXED] Mock mode remains strict
+        min_allowed_dt_ms = EXPECTED_DT_MS * 0.5
+        max_allowed_dt_ms = EXPECTED_DT_MS * 1.5
+
+        if (
+            (dt < min_allowed_dt_ms)
+            | (dt > max_allowed_dt_ms)
+        ).any():
+            min_dt = dt.min()
+            max_dt = dt.max()
+            raise ValueError(
+                f"Unexpected timestamp intervals detected in file: {file_path}. "
+                f"min_dt_ms={min_dt}, "
+                f"max_dt_ms={max_dt}, "
+                f"allowed_range=[{min_allowed_dt_ms}, {max_allowed_dt_ms}]"
+            )
+
+    # [FIXED] Convert sensor columns to numeric before windowing
     sensor_columns = ["accX", "accY", "accZ"]
 
     for column in sensor_columns:
@@ -150,7 +185,7 @@ def validate_segment_dataframe(df, file_path):
             f"Non-numeric sensor values detected in file: {file_path}"
         )
 
-    # Normalize label before checking consistency.
+    # [FIXED] Normalize label before checking consistency
     df["label"] = df["label"].astype(str).str.lower().str.strip()
 
     if df["label"].nunique() != 1:
@@ -164,6 +199,9 @@ def validate_segment_dataframe(df, file_path):
         raise ValueError(
             f"Invalid label '{label}' in file: {file_path}"
         )
+
+    # [FIXED] Keep dataframe label canonical for downstream files
+    df["label"] = label
 
     return label
 
@@ -196,7 +234,7 @@ def create_windows(df):
 # SEGMENT PROCESSING
 # =========================================================
 
-def process_segment_file(file_path, output_dir, remaining_windows):
+def process_segment_file(file_path, output_dir, remaining_windows, mode):
     """
     Process one segment file and create sliding windows.
 
@@ -213,7 +251,7 @@ def process_segment_file(file_path, output_dir, remaining_windows):
     """
 
     df = pd.read_csv(file_path)
-    label = validate_segment_dataframe(df, file_path)
+    label = validate_segment_dataframe(df, file_path, mode)
 
     base_name = Path(file_path).stem
 
@@ -335,6 +373,7 @@ def run_windowing(mode):
                     file_path=file_path,
                     output_dir=output_dir,
                     remaining_windows=remaining_windows,
+                    mode=mode,
                 )
 
                 all_report_rows.extend(rows)

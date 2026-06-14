@@ -8,6 +8,7 @@ from config import (
     SAMPLING_RATE_HZ,
     EXPECTED_DT_MS,
     CLASS_LABELS,
+    LABEL_ALIASES,
     get_paths,
 )
 
@@ -18,6 +19,7 @@ from config import (
 
 MIN_DT_MS = EXPECTED_DT_MS * 0.5
 MAX_DT_MS = EXPECTED_DT_MS * 1.5
+GAP_THRESHOLD_MS = EXPECTED_DT_MS * 3
 
 MIN_SEGMENT_SECONDS = 2
 MIN_SEGMENT_SAMPLES = SAMPLING_RATE_HZ * MIN_SEGMENT_SECONDS
@@ -109,8 +111,8 @@ def normalize_label(value) -> str:
     """
     Normalize label value to lowercase string.
     """
-
-    return str(value).lower().strip()
+    normalized = str(value).lower().strip()
+    return LABEL_ALIASES.get(normalized, normalized)
 
 
 def collect_input_files(input_root: Path, mode: str) -> list[Path]:
@@ -223,34 +225,32 @@ def normalize_numeric_columns(df: pd.DataFrame, file_path: Path) -> pd.DataFrame
 # SEGMENT SPLITTING
 # =========================================================
 
-def find_breakpoints(df: pd.DataFrame) -> list[int]:
-    """
-    Find indexes where a segment should be split.
-
-    A breakpoint is created when timestamp interval is:
-        non-positive
-        too small
-        too large
-    """
-
+# 
+def find_breakpoints(df: pd.DataFrame, mode: str) -> list[int]:
     timestamps = df["timestamp_ms"].to_numpy()
     breakpoints = []
 
     for index in range(1, len(timestamps)):
         dt_ms = timestamps[index] - timestamps[index - 1]
 
-        if dt_ms <= 0 or dt_ms < MIN_DT_MS or dt_ms > MAX_DT_MS:
-            breakpoints.append(index)
+        if mode == "real":
+            #  Real data allows minor jitter. Split only on hard timestamp issues.
+            if dt_ms <= 0 or dt_ms > GAP_THRESHOLD_MS:
+                breakpoints.append(index)
+        else:
+            #  Mock data remains strict.
+            if dt_ms <= 0 or dt_ms < MIN_DT_MS or dt_ms > MAX_DT_MS:
+                breakpoints.append(index)
 
     return breakpoints
 
 
-def split_segments(df: pd.DataFrame) -> list[pd.DataFrame]:
+def split_segments(df: pd.DataFrame, mode: str) -> list[pd.DataFrame]:
     """
     Split one dataframe into continuous timestamp segments.
     """
 
-    breakpoints = find_breakpoints(df)
+    breakpoints = find_breakpoints(df, mode)
 
     segments = []
     start_idx = 0
@@ -270,7 +270,7 @@ def split_segments(df: pd.DataFrame) -> list[pd.DataFrame]:
 # FILE PROCESSING
 # =========================================================
 
-def process_file(file_path: Path, output_root: Path) -> list[dict]:
+def process_file(file_path: Path, output_root: Path, mode: str) -> list[dict]:
     """
     Process one raw CSV file and save valid segments.
 
@@ -283,7 +283,7 @@ def process_file(file_path: Path, output_root: Path) -> list[dict]:
     label = validate_dataframe(df, file_path)
     df = normalize_numeric_columns(df, file_path)
 
-    segments = split_segments(df)
+    segments = split_segments(df, mode)
 
     label_output_dir = output_root / label
     label_output_dir.mkdir(parents=True, exist_ok=True)
@@ -381,6 +381,7 @@ def run_segmenter(mode: str, auto_clean: bool = True) -> None:
             rows = process_file(
                 file_path=file_path,
                 output_root=output_root,
+                mode=mode,
             )
 
             all_report_rows.extend(rows)

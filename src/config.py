@@ -19,6 +19,20 @@ NYQUIST_FREQUENCY_HZ = SAMPLING_RATE_HZ / 2
 FREQ_RESOLUTION_HZ = SAMPLING_RATE_HZ / WINDOW_SIZE
 
 CLASS_LABELS = ["healthy", "imbalance", "obstruction"]
+# Define label aliases for more flexible labeling
+LABEL_ALIASES = {
+    "healthy": "healthy",
+    "normal": "healthy",
+    "good": "healthy",
+
+    "imbalance": "imbalance",
+    "imbalanced": "imbalance",
+    "imabalanced": "imbalance",  # Keep this because current filename has this typo.
+
+    "obstruction": "obstruction",
+    "clogged": "obstruction",
+    "blocked": "obstruction",
+}
 
 MAX_WINDOWS_PER_CLASS = 500
 
