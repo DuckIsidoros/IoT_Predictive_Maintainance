@@ -95,10 +95,10 @@ const getStatusColor = (status: string) => {
 };
 
   // Prepare FFT data for Recharts
-  const fftChartData = data.fft.frequencies.map((freq, idx) => ({
-    frequency: freq,
-    magnitude: data.fft.magnitudes[idx] || 0,
-  }));
+const fftChartData = (data.fft?.magnitudes || []).map((mag, idx) => ({
+  frequency: idx * (500 / 512), 
+  magnitude: mag || 0,
+}));
 
   // Prepare class scores for Recharts
   const classScoreData = Object.entries(data.inference.scores).map(([className, score]) => ({
