@@ -24,36 +24,52 @@ type TelemetryPayload = {
   };
 };
 
-export default function Home() {
-  const [connected, setConnected] = useState(false);
-  const [data, setData] = useState<TelemetryPayload | null>(null);
+  export default function Home() {
+    const [connected, setConnected] = useState(false);
+    const [data, setData] = useState<TelemetryPayload | null>(null);
+    const [lastUpdate, setLastUpdate] = useState<Date | null>(null);
 
-  useEffect(() => {
-    const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-    const host = window.location.hostname || "localhost";
-    const port = "8000";
-    const wsUrl = `${protocol}://${host}:${port}/ws/dashboard`;
+  // inside the message handler, after setData(msg.data):
 
-    const ws = new WebSocket(wsUrl);
-    ws.addEventListener("open", () => setConnected(true));
-    ws.addEventListener("close", () => setConnected(false));
-    ws.addEventListener("message", (ev) => {
-      try {
-        const msg = JSON.parse(ev.data);
-        if (msg.type === "snapshot" && msg.data) {
-          setData(msg.data);
-        }
-      } catch (e) {
-        console.error("ws parse error", e);
-      }
-    });
+    useEffect(() => {
+        let ws: WebSocket;
+        let reconnectTimer: ReturnType<typeof setTimeout>;
+        let unmounted = false;
 
-    return () => {
-      try {
-        ws.close();
-      } catch {}
-    };
-  }, []);
+        const connect = () => {
+          const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+          const host = window.location.hostname || "localhost";
+          const wsUrl = `${protocol}://${host}:8000/ws/dashboard`;
+
+          ws = new WebSocket(wsUrl);
+
+          ws.addEventListener("open", () => setConnected(true));
+          ws.addEventListener("close", () => {
+            setConnected(false);
+            if (!unmounted) reconnectTimer = setTimeout(connect, 2000);
+          });
+          ws.addEventListener("error", () => ws.close());
+          ws.addEventListener("message", (ev) => {
+            try {
+              const msg = JSON.parse(ev.data);
+              if (msg.type === "snapshot" && msg.data) {
+                setData(msg.data);
+                setLastUpdate(new Date());
+              }
+            } catch (e) {
+              console.error("ws parse error", e);
+            }
+          });
+        };
+
+        connect();
+
+        return () => {
+          unmounted = true;
+          clearTimeout(reconnectTimer);
+          try { ws.close(); } catch {}
+        };
+    }, []);
 
   if (!data) {
     return (
@@ -72,11 +88,11 @@ export default function Home() {
   };
 
   
-  const getStatusColor = (status: string) => {
+const getStatusColor = (status: string) => {
     if (status === "OK" || status === "Running" || status === "Connected") return "text-green-800";
     if (status === "Warning") return "bg-yellow-100 text-yellow-800";
     return "bg-red-100 text-red-800";
-  };
+};
 
   // Prepare FFT data for Recharts
   const fftChartData = data.fft.frequencies.map((freq, idx) => ({
@@ -102,7 +118,9 @@ export default function Home() {
           <div className={`px-4 py-2 rounded-lg font-semibold`}>
             {connected ? "🟢 Connected" : "🔴 Disconnected"}
           </div>
-          <div className="text-sm text-gray-400">{data.timestamp}</div>
+          <div className="text-sm text-gray-400"> 
+            {lastUpdate ? `Last update: ${lastUpdate.toLocaleTimeString()}` : "No data yet"} 
+          </div>
         </div>
       </header>
 
