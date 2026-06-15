@@ -13,8 +13,7 @@ import aiomqtt
 import aiosqlite
 
 clients: List[WebSocket] = []
-latest_data = {} # Global state
-
+latest_data = {}
 async def broadcast(payload: object) -> None:
     for ws in list(clients):
         try:

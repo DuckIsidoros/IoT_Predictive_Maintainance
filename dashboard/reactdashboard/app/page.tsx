@@ -87,6 +87,12 @@ type TelemetryPayload = {
     return "text-red-600";
   };
 
+  const getInferenceColor = (prediction: string) => {
+    if (prediction.toLowerCase().includes("healthy")) return "text-green-600";
+    if (prediction.toLowerCase().includes("imbalanced")) return "text-yellow-600";
+    return "text-red-600";
+  };
+
   
 const getStatusColor = (status: string) => {
     if (status === "OK" || status === "Running" || status === "Connected") return "text-green-800";
@@ -249,7 +255,7 @@ const fftChartData = (data.fft?.magnitudes || []).map((mag, idx) => ({
           {/* Prediction Card */}
           <div className="bg-slate-800 rounded p-6">
             <div className="text-sm text-gray-400 mb-2">Prediction</div>
-            <div className={`text-3xl font-bold ${getConfidenceColor(data.inference.confidence)}`}>
+            <div className={`text-3xl font-bold ${getInferenceColor(data.inference.prediction)}`}>
               {data.inference.prediction}
             </div>
             <div className={`text-lg font-semibold mt-2 ${getConfidenceColor(data.inference.confidence)}`}>
