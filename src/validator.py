@@ -9,6 +9,7 @@ from config import (
     SAMPLING_RATE_HZ,
     EXPECTED_DT_MS,
     CLASS_LABELS,
+    LABEL_ALIASES,
     get_paths,
 )
 
@@ -110,6 +111,17 @@ def infer_label_from_filename(file_path):
         return matched_labels[0]
 
     return None
+def normalize_label(label):
+    """
+    Normalize label using defined aliases.
+
+    This allows more flexible labeling in the CSV files.
+    """
+
+    if label is None:
+        return None
+    normalized = str(label).strip().lower()
+    return LABEL_ALIASES.get(normalized, normalized)
 
 
 def safe_numeric_series(df, column_name):
@@ -180,12 +192,12 @@ def validate_file(file_path, expected_status=None, mode="mock"):
         "num_extreme_sensor_rows": 0,
         "decision": None,
     }
-
+    # Check file extension
     if file_path.suffix.lower() != ".csv":
         add_reason(result, "FAIL", "not_csv_file")
         result["decision"] = result["status"]
         return result
-
+    # Check if file is empty or cannot be read
     try:
         df = pd.read_csv(file_path)
     except Exception as exc:
@@ -194,29 +206,33 @@ def validate_file(file_path, expected_status=None, mode="mock"):
         return result
 
     result["total_samples"] = len(df)
-
+    # Check if file is empty
     if len(df) == 0:
         add_reason(result, "FAIL", "empty_file")
         result["decision"] = result["status"]
         return result
-
+    # Check for duplicated header rows
     if has_duplicated_header_rows(df):
         add_reason(result, "FAIL", "duplicated_header_rows_detected")
-
+    # Check for required columns
     missing_cols = [col for col in REQUIRED_COLUMNS if col not in df.columns]
     if missing_cols:
         add_reason(result, "FAIL", f"missing_required_columns: {missing_cols}")
         result["decision"] = result["status"]
         return result
-
+    # Process label column if available, otherwise infer from filename
     if OPTIONAL_LABEL_COLUMN in df.columns:
         unique_labels = df[OPTIONAL_LABEL_COLUMN].dropna().astype(str).str.strip().unique()
-
+    # If label column is present but empty, try to infer from filename and issue a warning for mock data or fail for real data
         if len(unique_labels) == 1:
-            label = unique_labels[0]
+            raw_label = unique_labels[0]
+            label = normalize_label(raw_label)
             result["label"] = label
             result["label_source"] = "column"
-        elif len(unique_labels) == 0:
+
+            if str(raw_label).strip().lower() != label:
+                add_reason(result, "WARNING", f"label_normalized_from_{raw_label}->{label}")
+        elif len(unique_labels) == 0:#no valid labels in column, try to infer from filename
             label = infer_label_from_filename(file_path)
             result["label"] = label
             result["label_source"] = "filename"
@@ -237,20 +253,20 @@ def validate_file(file_path, expected_status=None, mode="mock"):
             add_reason(result, "FAIL", "missing_label_column")
         else:
             add_reason(result, "FAIL", "missing_label_column")
-
+    # Check if label is valid
     if result["label"] not in CLASS_LABELS:
         add_reason(result, "FAIL", f"invalid_or_missing_label: {result['label']}")
-
+    # If there are already reasons for failure, we can skip the rest of the checks to save time
     if len(df) < 2:
         add_reason(result, "FAIL", "not_enough_samples")
         result["decision"] = result["status"]
         return result
-
+    # Check numeric columns and count NaN/inf/extreme values
     numeric_columns = ["timestamp_ms", "accX", "accY", "accZ"]
-
+    # Convert to numeric and count non-numeric values as NaN
     for column in numeric_columns:
         df[column] = safe_numeric_series(df, column)
-
+    # Count NaN values in any of the numeric columns
     nan_rows = df[numeric_columns].isna().any(axis=1).sum()
     result["num_nan_rows"] = int(nan_rows)
 
@@ -297,9 +313,11 @@ def validate_file(file_path, expected_status=None, mode="mock"):
 
     bad_dt = ((dt < MIN_DT_MS) | (dt > MAX_DT_MS)).sum()
     result["num_bad_dt"] = int(bad_dt)
-
-    if bad_dt > 0:
-        add_reason(result, "FAIL", "inconsistent_sampling_interval")
+    if bad_dt > 0: 
+        if mode == "real":
+            add_reason(result, "WARNING", "inconsistent_sampling_interval")
+        else:
+            add_reason(result, "FAIL", "inconsistent_sampling_interval")
 
     large_gaps = dt[dt > GAP_THRESHOLD_MS]
     result["num_large_gaps"] = int(len(large_gaps))
@@ -316,20 +334,24 @@ def validate_file(file_path, expected_status=None, mode="mock"):
 
         result["effective_fs"] = effective_fs
         result["fs_error_ratio"] = fs_error_ratio
-
+    # more lenient thresholds for real data to account for natural variability, while stricter for mock data which should be clean
         if fs_error_ratio > MAX_FS_ERROR_RATIO_FAIL:
-            add_reason(result, "FAIL", "effective_sampling_rate_deviation_fail")
+            if mode == "real":
+                add_reason(result, "WARNING", "effective_sampling_rate_deviation_fail")
+            else:
+                add_reason(result, "FAIL", "effective_sampling_rate_deviation_fail")
         elif fs_error_ratio > MAX_FS_ERROR_RATIO_WARNING:
             add_reason(result, "WARNING", "effective_sampling_rate_deviation_warning")
 
     if mean_dt and mean_dt > 0:
         jitter_ratio = std_dt / mean_dt if pd.notna(std_dt) else 0.0
         result["jitter_ratio"] = jitter_ratio
-
+        # more lenient thresholds for real data to account for natural variability, while stricter for mock data which should be clean
         if jitter_ratio > MAX_JITTER_RATIO_FAIL:
-            add_reason(result, "FAIL", "high_sampling_jitter_fail")
-        elif jitter_ratio > MAX_JITTER_RATIO_WARNING:
-            add_reason(result, "WARNING", "high_sampling_jitter_warning")
+            if mode == "real":
+                add_reason(result, "WARNING", "high_sampling_jitter_warning")
+            else:
+                add_reason(result, "FAIL", "high_sampling_jitter_fail")
 
     if len(result["reasons"]) == 0:
         result["reasons"] = ["ok"]

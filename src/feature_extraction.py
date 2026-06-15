@@ -461,9 +461,9 @@ def extract_features_from_fft_file(file_path: Path) -> tuple[dict, dict]:
         "total_energy": total_energy,
         "spectral_centroid": spectral_centroid,
         "spectral_bandwidth": spectral_bandwidth,
-        "BandPower_Low": band_power_low,
-        "BandPower_Mid": band_power_mid,
-        "BandPower_High": band_power_high,
+        "BandPower_Z_Low": band_power_low,
+        "BandPower_Z_Mid": band_power_mid,
+        "BandPower_Z_High": band_power_high,
         "label": label,
     }
 
@@ -516,9 +516,9 @@ def extract_hybrid_features_from_fft_file(
         "RMS_Y": time_features["RMS_Y"],
         "RMS_Z": time_features["RMS_Z"],
 
-        "BandPower_Low": fft_features["BandPower_Low"],
-        "BandPower_Mid": fft_features["BandPower_Mid"],
-        "BandPower_High": fft_features["BandPower_High"],
+        "BandPower_Z_Low": fft_features["BandPower_Z_Low"],
+        "BandPower_Z_Mid": fft_features["BandPower_Z_Mid"],
+        "BandPower_Z_High": fft_features["BandPower_Z_High"],
 
         "dominant_frequency": fft_features["dominant_frequency"],
         "max_magnitude": fft_features["max_magnitude"],
