@@ -1,4 +1,5 @@
 import argparse
+import re
 import shutil
 from pathlib import Path
 
@@ -7,6 +8,9 @@ import pandas as pd
 from config import (
     SAMPLING_RATE_HZ,
     EXPECTED_DT_MS,
+    SAMPLE_PERIOD_MS,
+    MAX_ALLOWED_GAP_MS,
+    FEATURE_COLUMNS,
     CLASS_LABELS,
     LABEL_ALIASES,
     get_paths,
@@ -19,12 +23,12 @@ from config import (
 
 MIN_DT_MS = EXPECTED_DT_MS * 0.5
 MAX_DT_MS = EXPECTED_DT_MS * 1.5
-GAP_THRESHOLD_MS = EXPECTED_DT_MS * 3
+GAP_THRESHOLD_MS = MAX_ALLOWED_GAP_MS
 
 MIN_SEGMENT_SECONDS = 2
 MIN_SEGMENT_SAMPLES = SAMPLING_RATE_HZ * MIN_SEGMENT_SECONDS
 
-REQUIRED_COLUMNS = ["timestamp_ms", "accX", "accY", "accZ", "label"]
+REQUIRED_COLUMNS = ["timestamp_ms", *FEATURE_COLUMNS, "label"]
 
 AUTO_CLEAN_OUTPUT = True
 
@@ -36,21 +40,10 @@ AUTO_CLEAN_OUTPUT = True
 def parse_args():
     """
     Parse command-line arguments.
-
-    Usage:
-        python src/segmenter.py --mode mock
-        python src/segmenter.py --mode real
     """
 
     parser = argparse.ArgumentParser(
         description="Split raw sensor CSV files into valid continuous segments."
-    )
-
-    parser.add_argument(
-        "--mode",
-        choices=["mock", "real"],
-        default="mock",
-        help="Choose between mock data or real data.",
     )
 
     parser.add_argument(
@@ -96,13 +89,14 @@ def infer_label_from_path(file_path: Path) -> str | None:
 
     file_name = file_path.name.lower().strip()
 
-    matched_labels = [
-        label for label in CLASS_LABELS
-        if label.lower() in file_name
-    ]
+    matched_labels = set()
+
+    for alias, canonical_label in LABEL_ALIASES.items():
+        if alias in file_name:
+            matched_labels.add(canonical_label)
 
     if len(matched_labels) == 1:
-        return matched_labels[0]
+        return next(iter(matched_labels))
 
     return None
 
@@ -115,36 +109,52 @@ def normalize_label(value) -> str:
     return LABEL_ALIASES.get(normalized, normalized)
 
 
-def collect_input_files(input_root: Path, mode: str) -> list[Path]:
+def rewrite_labels_from_filename(df: pd.DataFrame, file_path: Path) -> tuple[pd.DataFrame, str, bool]:
     """
-    Collect CSV files from the input root.
+    Force the label column to match the class inferred from the file path.
 
-    Mock mode:
-        Only collect files inside class folders.
-        This prevents old root-level test files from being mixed into the mock pipeline.
+    Returns:
+        updated dataframe, canonical label, whether any row was changed
+    """
 
-    Real mode:
-        Collect CSV files recursively.
-        This supports both flat accepted folders and class-based accepted folders.
+    inferred_label = infer_label_from_path(file_path)
+
+    if inferred_label is None:
+        raise ValueError(f"Cannot infer label from file name/path: {file_path}")
+
+    inferred_label = normalize_label(inferred_label)
+
+    if inferred_label not in CLASS_LABELS:
+        raise ValueError(f"Inferred invalid label '{inferred_label}' from {file_path}")
+
+    label_exists = "label" in df.columns
+
+    if label_exists:
+        current_labels = (
+            df["label"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            .map(normalize_label)
+        )
+        labels_changed = not current_labels.eq(inferred_label).all()
+    else:
+        labels_changed = True
+
+    df["label"] = inferred_label
+
+    return df, inferred_label, labels_changed
+
+
+def collect_input_files(input_root: Path) -> list[Path]:
+    """
+    Collect CSV files from the accepted deployment input root.
     """
 
     if not input_root.exists():
         raise FileNotFoundError(f"Input root does not exist: {input_root}")
 
-    if mode == "mock":
-        files = []
-
-        for label in CLASS_LABELS:
-            label_dir = input_root / label
-
-            if not label_dir.exists():
-                print(f"[WARNING] Missing mock label folder: {label_dir}")
-                continue
-
-            files.extend(sorted(label_dir.glob("*.csv")))
-
-    else:
-        files = sorted(input_root.rglob("*.csv"))
+    files = sorted(input_root.rglob("*.csv"))
 
     if not files:
         raise FileNotFoundError(f"No CSV files found under: {input_root}")
@@ -171,30 +181,7 @@ def validate_dataframe(df: pd.DataFrame, file_path: Path) -> str:
     if missing_cols:
         raise ValueError(f"Missing columns in {file_path}: {missing_cols}")
 
-    label_values = (
-        df["label"]
-        .dropna()
-        .astype(str)
-        .str.lower()
-        .str.strip()
-        .unique()
-    )
-
-    if len(label_values) == 0:
-        inferred_label = infer_label_from_path(file_path)
-
-        if inferred_label is None:
-            raise ValueError(f"Missing label and cannot infer from path: {file_path}")
-
-        df["label"] = inferred_label
-        return inferred_label
-
-    if len(label_values) > 1:
-        raise ValueError(
-            f"Mixed labels detected in {file_path}: {list(label_values)}"
-        )
-
-    label = normalize_label(label_values[0])
+    label = normalize_label(df["label"].iloc[0])
 
     if label not in CLASS_LABELS:
         raise ValueError(f"Invalid label '{label}' in file: {file_path}")
@@ -210,9 +197,23 @@ def normalize_numeric_columns(df: pd.DataFrame, file_path: Path) -> pd.DataFrame
     Invalid values become NaN and are rejected before segmentation.
     """
 
-    numeric_columns = ["timestamp_ms", "accX", "accY", "accZ"]
+    timestamp_series = df["timestamp_ms"].astype(str).str.strip()
+    df["timestamp_ms"] = pd.to_numeric(timestamp_series, errors="coerce")
 
-    for column in numeric_columns:
+    missing_ts_mask = df["timestamp_ms"].isna()
+    if missing_ts_mask.any():
+        extracted = timestamp_series[missing_ts_mask].str.extract(
+            r"([+-]?(?:\d+(?:\.\d*)?|\.\d+))",
+            expand=False,
+        )
+        df.loc[missing_ts_mask, "timestamp_ms"] = pd.to_numeric(
+            extracted,
+            errors="coerce",
+        )
+
+    numeric_columns = ["timestamp_ms", *FEATURE_COLUMNS]
+
+    for column in FEATURE_COLUMNS:
         df[column] = pd.to_numeric(df[column], errors="coerce")
 
     if df[numeric_columns].isna().any().any():
@@ -226,31 +227,25 @@ def normalize_numeric_columns(df: pd.DataFrame, file_path: Path) -> pd.DataFrame
 # =========================================================
 
 # 
-def find_breakpoints(df: pd.DataFrame, mode: str) -> list[int]:
+def find_breakpoints(df: pd.DataFrame) -> list[int]:
     timestamps = df["timestamp_ms"].to_numpy()
     breakpoints = []
 
     for index in range(1, len(timestamps)):
         dt_ms = timestamps[index] - timestamps[index - 1]
 
-        if mode == "real":
-            #  Real data allows minor jitter. Split only on hard timestamp issues.
-            if dt_ms <= 0 or dt_ms > GAP_THRESHOLD_MS:
-                breakpoints.append(index)
-        else:
-            #  Mock data remains strict.
-            if dt_ms <= 0 or dt_ms < MIN_DT_MS or dt_ms > MAX_DT_MS:
-                breakpoints.append(index)
+        if dt_ms <= 0 or dt_ms > GAP_THRESHOLD_MS:
+            breakpoints.append(index)
 
     return breakpoints
 
 
-def split_segments(df: pd.DataFrame, mode: str) -> list[pd.DataFrame]:
+def split_segments(df: pd.DataFrame) -> list[pd.DataFrame]:
     """
     Split one dataframe into continuous timestamp segments.
     """
 
-    breakpoints = find_breakpoints(df, mode)
+    breakpoints = find_breakpoints(df)
 
     segments = []
     start_idx = 0
@@ -270,7 +265,7 @@ def split_segments(df: pd.DataFrame, mode: str) -> list[pd.DataFrame]:
 # FILE PROCESSING
 # =========================================================
 
-def process_file(file_path: Path, output_root: Path, mode: str) -> list[dict]:
+def process_file(file_path: Path, output_root: Path) -> list[dict]:
     """
     Process one raw CSV file and save valid segments.
 
@@ -279,11 +274,15 @@ def process_file(file_path: Path, output_root: Path, mode: str) -> list[dict]:
     """
 
     df = pd.read_csv(file_path)
+    df, inferred_label, labels_changed = rewrite_labels_from_filename(df, file_path)
+
+    if labels_changed:
+        df.to_csv(file_path, index=False)
 
     label = validate_dataframe(df, file_path)
     df = normalize_numeric_columns(df, file_path)
 
-    segments = split_segments(df, mode)
+    segments = split_segments(df)
 
     label_output_dir = output_root / label
     label_output_dir.mkdir(parents=True, exist_ok=True)
@@ -330,6 +329,8 @@ def process_file(file_path: Path, output_root: Path, mode: str) -> list[dict]:
             "expected_dt_ms": EXPECTED_DT_MS,
             "min_dt_ms": MIN_DT_MS,
             "max_dt_ms": MAX_DT_MS,
+            "label_from_filename": inferred_label,
+            "labels_rewritten": labels_changed,
             "min_segment_samples": MIN_SEGMENT_SAMPLES,
             "status": status,
             "reason": reason,
@@ -342,28 +343,27 @@ def process_file(file_path: Path, output_root: Path, mode: str) -> list[dict]:
 # MAIN PIPELINE
 # =========================================================
 
-def run_segmenter(mode: str, auto_clean: bool = True) -> None:
+def run_segmenter(auto_clean: bool = True) -> None:
     """
-    Run segment splitting pipeline for mock or real mode.
+    Run segment splitting pipeline for accepted deployment data.
     """
 
-    paths = get_paths(mode)
+    paths = get_paths()
 
-    input_root = paths["raw"]
+    input_root = paths["accepted"]
     output_root = paths["segments"]
     report_path = paths["segment_report"]
 
     print("=" * 70)
     print("SEGMENTER PIPELINE STARTED")
     print("=" * 70)
-    print(f"Mode                 : {mode}")
     print(f"Input root           : {input_root}")
     print(f"Output root          : {output_root}")
     print(f"Report path          : {report_path}")
     print(f"Sampling rate        : {SAMPLING_RATE_HZ} Hz")
+    print(f"Sample period        : {SAMPLE_PERIOD_MS:.3f} ms")
     print(f"Expected dt          : {EXPECTED_DT_MS:.3f} ms")
-    print(f"Min dt               : {MIN_DT_MS:.3f} ms")
-    print(f"Max dt               : {MAX_DT_MS:.3f} ms")
+    print(f"Max gap allowed      : {GAP_THRESHOLD_MS:.3f} ms")
     print(f"Min segment seconds  : {MIN_SEGMENT_SECONDS}")
     print(f"Min segment samples  : {MIN_SEGMENT_SAMPLES}")
     print(f"Auto clean output    : {auto_clean}")
@@ -371,7 +371,7 @@ def run_segmenter(mode: str, auto_clean: bool = True) -> None:
 
     prepare_output_dir(output_root, auto_clean=auto_clean)
 
-    input_files = collect_input_files(input_root, mode)
+    input_files = collect_input_files(input_root)
 
     all_report_rows = []
     failed_files = []
@@ -381,7 +381,6 @@ def run_segmenter(mode: str, auto_clean: bool = True) -> None:
             rows = process_file(
                 file_path=file_path,
                 output_root=output_root,
-                mode=mode,
             )
 
             all_report_rows.extend(rows)
@@ -408,6 +407,8 @@ def run_segmenter(mode: str, auto_clean: bool = True) -> None:
                 "expected_dt_ms": EXPECTED_DT_MS,
                 "min_dt_ms": MIN_DT_MS,
                 "max_dt_ms": MAX_DT_MS,
+                "label_from_filename": infer_label_from_path(file_path),
+                "labels_rewritten": None,
                 "min_segment_samples": MIN_SEGMENT_SAMPLES,
                 "status": "FAILED",
                 "reason": str(exc),
@@ -450,7 +451,6 @@ def main() -> None:
     args = parse_args()
 
     run_segmenter(
-        mode=args.mode,
         auto_clean=not args.no_clean,
     )
 

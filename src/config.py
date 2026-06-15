@@ -5,12 +5,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 # ======================================================
 # core signal config
 # ======================================================
-SAMPLING_RATE_HZ = 200
-EXPECTED_DT_MS = 1000 / SAMPLING_RATE_HZ
+SAMPLING_RATE_HZ = 500
+SAMPLE_PERIOD_MS = 2.0
+EXPECTED_DT_MS = SAMPLE_PERIOD_MS
 
-WINDOW_SIZE = 256
+FEATURE_COLUMNS = ["accX", "accY", "accZ"]
+HPF_ALPHA = 0.9936
+MAX_ALLOWED_GAP_MS = 3.0
+
+WINDOW_SIZE = 640
 OVERLAP_RATIO = 0.5
-STEP_SIZE = int(WINDOW_SIZE * (1 - OVERLAP_RATIO))
+STEP_SIZE = 320
 
 EXPECTED_FFT_BINS = WINDOW_SIZE // 2 + 1
 EXPECTED_FREQ_MIN_HZ = 0.0
@@ -18,16 +23,16 @@ EXPECTED_FREQ_MAX_HZ = SAMPLING_RATE_HZ / 2
 NYQUIST_FREQUENCY_HZ = SAMPLING_RATE_HZ / 2
 FREQ_RESOLUTION_HZ = SAMPLING_RATE_HZ / WINDOW_SIZE
 
-CLASS_LABELS = ["healthy", "imbalance", "obstruction"]
+CLASS_LABELS = ["healthy", "imbalanced", "obstruction"]
 # Define label aliases for more flexible labeling
 LABEL_ALIASES = {
     "healthy": "healthy",
     "normal": "healthy",
     "good": "healthy",
 
-    "imbalance": "imbalance",
-    "imbalanced": "imbalance",
-    "imabalanced": "imbalance",  # Keep this because current filename has this typo.
+    "imbalance": "imbalanced",
+    "imbalanced": "imbalanced",
+    "imabalanced": "imbalanced",
 
     "obstruction": "obstruction",
     "clogged": "obstruction",
@@ -37,26 +42,11 @@ LABEL_ALIASES = {
 MAX_WINDOWS_PER_CLASS = 500
 
 # ======================================================
-# mock file path
+# deployment file path
 # ======================================================
-MOCK_PATHS = {
-    "raw": PROJECT_ROOT / "mock_raw_sensor_stream",
-    "corrupted": PROJECT_ROOT / "corrupted_data",
-    "qc_reports": PROJECT_ROOT / "qc_reports",
-    "segments": PROJECT_ROOT / "segments",
-    "windows": PROJECT_ROOT / "windows",
-    "fft_windows": PROJECT_ROOT / "fft_windows",
-    "features": PROJECT_ROOT / "features",
-    "segment_report": PROJECT_ROOT / "segment_report.csv",
-    "window_report": PROJECT_ROOT / "window_report.csv",
-    "fft_report": PROJECT_ROOT / "fft_report.csv",
-}
-# ======================================================
-# real file path
-# ======================================================
-REAL_PATHS = {
-    "raw": PROJECT_ROOT / "real_raw_sensor_stream" / "accepted",
+PIPELINE_PATHS = {
     "incoming": PROJECT_ROOT / "real_raw_sensor_stream" / "incoming",
+    "accepted": PROJECT_ROOT / "real_raw_sensor_stream" / "accepted",
     "rejected": PROJECT_ROOT / "real_raw_sensor_stream" / "rejected",
     "metadata": PROJECT_ROOT / "real_raw_sensor_stream" / "metadata",
     "qc_reports": PROJECT_ROOT / "real_qc_reports",
@@ -68,12 +58,7 @@ REAL_PATHS = {
     "window_report": PROJECT_ROOT / "real_window_report.csv",
     "fft_report": PROJECT_ROOT / "real_fft_report.csv",
 }
-#switch between mock and real data by changing this variable
-def get_paths(mode: str)-> dict:
-    mode = mode.lower().strip()#make sure the input is case-insensitive and has no leading/trailing spaces
-    if mode == "mock":
-        return MOCK_PATHS
-    elif mode == "real":
-        return REAL_PATHS
-    else:
-        raise ValueError(f"Invalid mode '{mode}'. Expected 'mock' or 'real'.")
+
+
+def get_paths() -> dict:
+    return PIPELINE_PATHS
