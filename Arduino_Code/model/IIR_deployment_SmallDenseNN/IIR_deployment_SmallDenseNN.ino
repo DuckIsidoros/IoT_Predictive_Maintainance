@@ -83,16 +83,16 @@ PubSubClient client(espClient);
 
 void updateRawBuffers(float x, float y, float z) {
   // Shift values to the left
-  for(int i = 0; i < 19; i++) {
+    for(int i = 0; i < 19; i++) {
     rawX_buffer[i] = rawX_buffer[i+1];
     rawY_buffer[i] = rawY_buffer[i+1];
     rawZ_buffer[i] = rawZ_buffer[i+1];
-  }
-  // Add new value
-  rawX_buffer[19] = x;
-  rawY_buffer[19] = y;
-  rawZ_buffer[19] = z;
-}
+    }
+    // Add new value
+    rawX_buffer[19] = x;
+    rawY_buffer[19] = y;
+    rawZ_buffer[19] = z;
+    }
 
 void setup_wifi() {
     Serial.println("Connecting to WiFi...");

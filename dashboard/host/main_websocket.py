@@ -88,31 +88,6 @@ async def init_db():
         """)
         await db.commit()
 
-async def mqtt_listener():
-    global latest_data
-    # Ensure table exists
-    await init_db()
-    
-    async with aiomqtt.Client("localhost") as client:
-        await client.subscribe("vibration/inference")
-        async for message in client.messages:
-            payload_str = message.payload.decode()
-            data = json.loads(payload_str)
-            latest_data = data
-            
-            # --- ADD THIS TO SAVE TO SQLITE ---
-            async with aiosqlite.connect("vibration_data.db") as db:
-                await db.execute(
-                    "INSERT INTO vibration_logs (timestamp, prediction, confidence, fan_state) VALUES (?, ?, ?, ?)",
-                    (data.get("timestamp"), 
-                    data["inference"]["prediction"], 
-                    data["inference"]["confidence"], 
-                    data["status"]["fan_state"])
-                )
-                await db.commit()
-            # ----------------------------------
-            
-            await broadcast({"type": "snapshot", "data": latest_data})
             
 @app.get("/api/history")
 async def get_history():
