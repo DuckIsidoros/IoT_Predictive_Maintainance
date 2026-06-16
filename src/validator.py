@@ -24,7 +24,7 @@ OPTIONAL_LABEL_COLUMN = "label"
 
 MIN_DT_MS = EXPECTED_DT_MS * 0.5
 MAX_DT_MS = EXPECTED_DT_MS * 1.5
-GAP_THRESHOLD_MS = EXPECTED_DT_MS * 3
+GAP_THRESHOLD_MS = EXPECTED_DT_MS * 6
 
 MAX_JITTER_RATIO_WARNING = 0.10
 MAX_JITTER_RATIO_FAIL = 0.20
@@ -337,7 +337,7 @@ def validate_file(file_path, expected_status=None, mode="mock"):
     # more lenient thresholds for real data to account for natural variability, while stricter for mock data which should be clean
         if fs_error_ratio > MAX_FS_ERROR_RATIO_FAIL:
             if mode == "real":
-                add_reason(result, "WARNING", "effective_sampling_rate_deviation_fail")
+                add_reason(result, "WARNING", "effective_sampling_rate_deviation_warning")
             else:
                 add_reason(result, "FAIL", "effective_sampling_rate_deviation_fail")
         elif fs_error_ratio > MAX_FS_ERROR_RATIO_WARNING:

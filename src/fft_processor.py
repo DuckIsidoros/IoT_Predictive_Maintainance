@@ -11,6 +11,7 @@ from config import (  #  Centralize pipeline configuration in config.py.
     EXPECTED_FREQ_MAX_HZ,
     NYQUIST_FREQUENCY_HZ,
     FREQ_RESOLUTION_HZ,
+    FEATURE_COLUMNS,
     CLASS_LABELS,
     get_paths,
 )
@@ -21,10 +22,10 @@ from config import (  #  Centralize pipeline configuration in config.py.
 # =========================================================
 
 #  Keep required columns local because they are specific to window CSV schema.
-REQUIRED_COLUMNS = ["timestamp_ms", "accX", "accY", "accZ", "label"]
+REQUIRED_COLUMNS = ["timestamp_ms", *FEATURE_COLUMNS, "label"]
 
 #  Keep sensor columns local because FFT only uses acceleration signals.
-SENSOR_COLUMNS = ["accX", "accY", "accZ"]
+SENSOR_COLUMNS = FEATURE_COLUMNS
 
 
 
@@ -36,31 +37,9 @@ SENSOR_COLUMNS = ["accX", "accY", "accZ"]
 def parse_args():
     """
     Parse command-line arguments.
-
-    
-    Supports:
-        --mode mock
-        --mode real
-
-    mock:
-        Input  = windows/
-        Output = fft_windows/
-        Report = fft_report.csv
-
-    real:
-        Input  = real_windows/
-        Output = real_fft_windows/
-        Report = real_fft_report.csv
     """
     parser = argparse.ArgumentParser(
-        description="FFT processor for mock or real vibration window data."
-    )
-
-    parser.add_argument(
-        "--mode",
-        choices=["mock", "real"],
-        default="mock",
-        help="Pipeline mode. Use 'mock' for regression test data or 'real' for real MPU6050 data.",
+        description="FFT processor for deployment vibration window data."
     )
 
     return parser.parse_args()
@@ -78,24 +57,24 @@ def validate_config():
     Values now come from config.py instead of local hard-coded constants.
     """
 
-    if SAMPLING_RATE_HZ != 200:
+    if SAMPLING_RATE_HZ != 500:
         raise ValueError(
-            f"Invalid sampling rate: {SAMPLING_RATE_HZ}, expected 200 Hz"
+            f"Invalid sampling rate: {SAMPLING_RATE_HZ}, expected 500 Hz"
         )
 
-    if WINDOW_SIZE != 256:
+    if WINDOW_SIZE != 640:
         raise ValueError(
-            f"Invalid window size: {WINDOW_SIZE}, expected 256 samples"
+            f"Invalid window size: {WINDOW_SIZE}, expected 640 samples"
         )
 
-    if EXPECTED_FFT_BINS != 129:
+    if EXPECTED_FFT_BINS != 321:
         raise ValueError(
-            f"Invalid FFT bins: {EXPECTED_FFT_BINS}, expected 129"
+            f"Invalid FFT bins: {EXPECTED_FFT_BINS}, expected 321"
         )
 
-    if EXPECTED_FREQ_MAX_HZ != 100:
+    if EXPECTED_FREQ_MAX_HZ != 250:
         raise ValueError(
-            f"Invalid Nyquist frequency: {EXPECTED_FREQ_MAX_HZ}, expected 100 Hz"
+            f"Invalid Nyquist frequency: {EXPECTED_FREQ_MAX_HZ}, expected 250 Hz"
         )
     if NYQUIST_FREQUENCY_HZ != SAMPLING_RATE_HZ / 2:
         raise ValueError(
@@ -122,7 +101,7 @@ def validate_mode_paths(paths: dict):
     if missing_keys:
         raise KeyError(
             f"Missing path config keys: {missing_keys}. "
-            f"Please update MOCK_PATHS/REAL_PATHS in config.py."
+            f"Please update PIPELINE_PATHS in config.py."
         )
 
 
@@ -284,19 +263,13 @@ def process_window_file(file_path: Path, output_dir: Path) -> dict:
 def main():
     """
     Main FFT processing pipeline.
-
-    
-    Pipeline now supports:
-        python src/fft_processor.py --mode mock
-        python src/fft_processor.py --mode real
     """
 
-    args = parse_args()
+    parse_args()
 
     validate_config()
 
-    # Load mode-specific paths from config.py.
-    paths = get_paths(args.mode)
+    paths = get_paths()
     validate_mode_paths(paths)
 
     # Resolve paths for selected mode.
@@ -309,7 +282,6 @@ def main():
     print("======================================")
     print("FFT PROCESSING STARTED")
     print("======================================")
-    print(f"Mode                      : {args.mode}")
     print(f"WINDOW_ROOT               : {window_root}")
     print(f"OUTPUT_ROOT               : {output_root}")
     print(f"REPORT_PATH               : {report_path}")
@@ -321,11 +293,9 @@ def main():
     print(f"Frequency Resolution      : {FREQ_RESOLUTION_HZ} Hz/bin")
     print("======================================")
 
-    # Fail clearly if input folder does not exist.
-    # For real mode, this is expected until real window data is available.
     if not window_root.exists():
         print(f"ERROR: Input window folder does not exist: {window_root}")
-        print("Hint: Run windowing first or check mode-specific paths in config.py.")
+        print("Hint: Run windowing first or check deployment paths in config.py.")
         return
 
     #  Create FFT output root folder if missing.

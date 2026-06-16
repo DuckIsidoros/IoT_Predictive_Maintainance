@@ -12,6 +12,7 @@ from config import (
     EXPECTED_FFT_BINS,
     EXPECTED_FREQ_MIN_HZ,
     EXPECTED_FREQ_MAX_HZ,
+    FEATURE_COLUMNS,
 )
 
 
@@ -33,20 +34,9 @@ AUTO_CLEAN_OUTPUT = True
 def parse_args():
     """
     Parse command-line arguments.
-
-    Usage:
-        python src/feature_extractor.py --mode mock
-        python src/feature_extractor.py --mode real
     """
     parser = argparse.ArgumentParser(
         description="Hybrid feature extraction from window CSV files and FFT CSV files"
-    )
-
-    parser.add_argument(
-        "--mode",
-        choices=["mock", "real"],
-        default="mock",
-        help="Choose between mock data or real data"
     )
 
     parser.add_argument(
@@ -99,7 +89,7 @@ def infer_label_from_path(file_path: Path) -> str:
 
     Supported labels:
         healthy
-        imbalance
+        imbalanced
         obstruction
     """
     parent_name = file_path.parent.name.lower().strip()
@@ -314,9 +304,9 @@ def extract_time_domain_features_from_window_file(
     df = pd.read_csv(window_file_path)
     validate_window_dataframe(df, window_file_path)
 
-    acc_x_col = find_column(df, ["accX", "accel_x", "x"])
-    acc_y_col = find_column(df, ["accY", "accel_y", "y"])
-    acc_z_col = find_column(df, ["accZ", "accel_z", "z"])
+    acc_x_col = find_column(df, [FEATURE_COLUMNS[0], "accel_x", "x"])
+    acc_y_col = find_column(df, [FEATURE_COLUMNS[1], "accel_y", "y"])
+    acc_z_col = find_column(df, [FEATURE_COLUMNS[2], "accel_z", "z"])
 
     acc_x = pd.to_numeric(df[acc_x_col], errors="coerce").to_numpy(dtype=float)
     acc_y = pd.to_numeric(df[acc_y_col], errors="coerce").to_numpy(dtype=float)
@@ -660,7 +650,7 @@ def main() -> None:
     """
     args = parse_args()
 
-    paths = get_paths(args.mode)
+    paths = get_paths()
 
     fft_input_dir = paths["fft_windows"]
     window_input_dir = paths["windows"]
@@ -669,7 +659,7 @@ def main() -> None:
     auto_clean = not args.no_clean
 
     print("=" * 70)
-    print(f"Feature Extractor - {args.mode.upper()} MODE")
+    print("Feature Extractor - DEPLOYMENT MODE")
     print("=" * 70)
     print(f"Input FFT folder    : {fft_input_dir}")
     print(f"Input window folder : {window_input_dir}")

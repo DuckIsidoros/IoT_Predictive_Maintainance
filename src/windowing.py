@@ -11,6 +11,8 @@ from config import (
     STEP_SIZE,
     CLASS_LABELS,
     MAX_WINDOWS_PER_CLASS,
+    MAX_ALLOWED_GAP_MS,
+    FEATURE_COLUMNS,
     get_paths,
 )
 from config import EXPECTED_DT_MS
@@ -20,7 +22,7 @@ from config import EXPECTED_DT_MS
 # CONSTANTS
 # =========================================================
 
-REQUIRED_COLUMNS = ["timestamp_ms", "accX", "accY", "accZ", "label"]
+REQUIRED_COLUMNS = ["timestamp_ms", *FEATURE_COLUMNS, "label"]
 
 WINDOW_DURATION_SEC = WINDOW_SIZE / SAMPLING_RATE_HZ
 STEP_DURATION_SEC = STEP_SIZE / SAMPLING_RATE_HZ
@@ -32,18 +34,11 @@ STEP_DURATION_SEC = STEP_SIZE / SAMPLING_RATE_HZ
 
 def parse_args():
     """
-    Parse command-line arguments for windowing mode selection.
+    Parse command-line arguments for deployment windowing.
     """
 
     parser = argparse.ArgumentParser(
         description="Create sliding windows from segmented sensor data."
-    )
-
-    parser.add_argument(
-        "--mode",
-        choices=["mock", "real"],
-        default="mock",
-        help="Pipeline mode. Use 'mock' for generated test data or 'real' for real sensor data.",
     )
 
     return parser.parse_args()
@@ -58,14 +53,14 @@ def validate_config():
     Ensure windowing configuration matches project requirements.
     """
 
-    if SAMPLING_RATE_HZ != 200:
+    if SAMPLING_RATE_HZ != 500:
         raise ValueError(
-            f"Invalid sampling rate: {SAMPLING_RATE_HZ}, expected 200 Hz"
+            f"Invalid sampling rate: {SAMPLING_RATE_HZ}, expected 500 Hz"
         )
 
-    if WINDOW_SIZE != 256:
+    if WINDOW_SIZE != 640:
         raise ValueError(
-            f"Invalid window size: {WINDOW_SIZE}, expected 256 samples"
+            f"Invalid window size: {WINDOW_SIZE}, expected 640 samples"
         )
 
     if OVERLAP_RATIO != 0.5:
@@ -73,9 +68,9 @@ def validate_config():
             f"Invalid overlap ratio: {OVERLAP_RATIO}, expected 0.5"
         )
 
-    if STEP_SIZE != 128:
+    if STEP_SIZE != 320:
         raise ValueError(
-            f"Invalid stride: {STEP_SIZE}, expected 128 samples"
+            f"Invalid stride: {STEP_SIZE}, expected 320 samples"
         )
 
     if MAX_WINDOWS_PER_CLASS <= 0:
@@ -83,21 +78,13 @@ def validate_config():
             f"Invalid max windows per class: {MAX_WINDOWS_PER_CLASS}, expected positive integer"
         )
 
-# [CHANGED] Add mode to support different timestamp policies for mock vs real
-def validate_segment_dataframe(df, file_path, mode):
+def validate_segment_dataframe(df, file_path):
     """
     Validate one segment dataframe before creating windows.
 
-    Mock mode:
-        Strict timestamp interval validation.
-
-    Real mode:
-        Allow MPU6050 sampling jitter.
-        Still reject rollback, duplicate timestamp, large gaps, NaN,
-        mixed labels, and invalid labels.
+    Allow deployment sampling jitter while rejecting hard timestamp faults.
     """
 
-    # [FIXED] Check required columns before accessing any column
     missing_cols = [col for col in REQUIRED_COLUMNS if col not in df.columns]
 
     if missing_cols:
@@ -105,20 +92,17 @@ def validate_segment_dataframe(df, file_path, mode):
             f"Missing columns in {file_path}: {missing_cols}"
         )
 
-    # [FIXED] Reject empty segment early
     if len(df) == 0:
         raise ValueError(
             f"Empty segment file: {file_path}"
         )
 
-    # [FIXED] Ensure segment is long enough for one FFT window
     if len(df) < WINDOW_SIZE:
         raise ValueError(
             f"Segment file has only {len(df)} samples, "
             f"expected at least {WINDOW_SIZE}: {file_path}"
         )
 
-    # [FIXED] Convert timestamp to numeric before checking continuity
     df["timestamp_ms"] = pd.to_numeric(
         df["timestamp_ms"],
         errors="coerce"
@@ -129,10 +113,8 @@ def validate_segment_dataframe(df, file_path, mode):
             f"Non-numeric timestamps detected in file: {file_path}"
         )
 
-    # [FIXED] Validate timestamp continuity with mode-aware policy
     dt = df["timestamp_ms"].diff().dropna()
 
-    # Always reject rollback or duplicate timestamp
     if (dt <= 0).any():
         min_dt = dt.min()
         raise ValueError(
@@ -140,39 +122,17 @@ def validate_segment_dataframe(df, file_path, mode):
             f"min_dt_ms={min_dt}"
         )
 
-    if mode == "real":
-        # [ADDED] Real MPU6050 data can have sampling jitter.
-        # Allow small/medium jitter; reject only large gaps.
-        real_gap_threshold_ms = EXPECTED_DT_MS * 6
+    real_gap_threshold_ms = MAX_ALLOWED_GAP_MS
 
-        if (dt > real_gap_threshold_ms).any():
-            max_dt = dt.max()
-            raise ValueError(
-                f"Large timestamp gaps detected in file: {file_path}. "
-                f"max_dt_ms={max_dt}, "
-                f"threshold_ms={real_gap_threshold_ms}"
-            )
+    if (dt > real_gap_threshold_ms).any():
+        max_dt = dt.max()
+        raise ValueError(
+            f"Large timestamp gaps detected in file: {file_path}. "
+            f"max_dt_ms={max_dt}, "
+            f"threshold_ms={real_gap_threshold_ms}"
+        )
 
-    else:
-        # [FIXED] Mock mode remains strict
-        min_allowed_dt_ms = EXPECTED_DT_MS * 0.5
-        max_allowed_dt_ms = EXPECTED_DT_MS * 1.5
-
-        if (
-            (dt < min_allowed_dt_ms)
-            | (dt > max_allowed_dt_ms)
-        ).any():
-            min_dt = dt.min()
-            max_dt = dt.max()
-            raise ValueError(
-                f"Unexpected timestamp intervals detected in file: {file_path}. "
-                f"min_dt_ms={min_dt}, "
-                f"max_dt_ms={max_dt}, "
-                f"allowed_range=[{min_allowed_dt_ms}, {max_allowed_dt_ms}]"
-            )
-
-    # [FIXED] Convert sensor columns to numeric before windowing
-    sensor_columns = ["accX", "accY", "accZ"]
+    sensor_columns = FEATURE_COLUMNS
 
     for column in sensor_columns:
         df[column] = pd.to_numeric(
@@ -185,7 +145,6 @@ def validate_segment_dataframe(df, file_path, mode):
             f"Non-numeric sensor values detected in file: {file_path}"
         )
 
-    # [FIXED] Normalize label before checking consistency
     df["label"] = df["label"].astype(str).str.lower().str.strip()
 
     if df["label"].nunique() != 1:
@@ -200,7 +159,6 @@ def validate_segment_dataframe(df, file_path, mode):
             f"Invalid label '{label}' in file: {file_path}"
         )
 
-    # [FIXED] Keep dataframe label canonical for downstream files
     df["label"] = label
 
     return label
@@ -234,7 +192,7 @@ def create_windows(df):
 # SEGMENT PROCESSING
 # =========================================================
 
-def process_segment_file(file_path, output_dir, remaining_windows, mode):
+def process_segment_file(file_path, output_dir, remaining_windows):
     """
     Process one segment file and create sliding windows.
 
@@ -251,7 +209,7 @@ def process_segment_file(file_path, output_dir, remaining_windows, mode):
     """
 
     df = pd.read_csv(file_path)
-    label = validate_segment_dataframe(df, file_path, mode)
+    label = validate_segment_dataframe(df, file_path)
 
     base_name = Path(file_path).stem
 
@@ -302,14 +260,14 @@ def process_segment_file(file_path, output_dir, remaining_windows, mode):
 # MAIN PIPELINE
 # =========================================================
 
-def run_windowing(mode):
+def run_windowing():
     """
-    Run the windowing pipeline for either mock or real mode.
+    Run the windowing pipeline for deployment data.
     """
 
     validate_config()
 
-    paths = get_paths(mode)
+    paths = get_paths()
 
     segment_root = paths["segments"]
     output_root = paths["windows"]
@@ -320,7 +278,6 @@ def run_windowing(mode):
     print("======================================")
     print("WINDOWING PIPELINE STARTED")
     print("======================================")
-    print(f"Mode                  : {mode}")
     print(f"SEGMENT_ROOT          : {segment_root}")
     print(f"OUTPUT_ROOT           : {output_root}")
     print(f"REPORT_PATH           : {report_path}")
@@ -373,7 +330,6 @@ def run_windowing(mode):
                     file_path=file_path,
                     output_dir=output_dir,
                     remaining_windows=remaining_windows,
-                    mode=mode,
                 )
 
                 all_report_rows.extend(rows)
@@ -420,8 +376,8 @@ def main():
     Entry point for command-line execution.
     """
 
-    args = parse_args()
-    run_windowing(args.mode)
+    parse_args()
+    run_windowing()
 
 
 if __name__ == "__main__":
