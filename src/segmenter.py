@@ -1,0 +1,444 @@
+import argparse
+import re
+import shutil
+from pathlib import Path
+
+import pandas as pd
+import numpy as np
+
+from config import (
+    SAMPLING_RATE_HZ,
+    EXPECTED_DT_MS,
+    SAMPLE_PERIOD_MS,
+    MAX_ALLOWED_GAP_MS,
+    FEATURE_COLUMNS,
+    CLASS_LABELS,
+    LABEL_ALIASES,
+    get_paths,
+)
+
+
+# =========================================================
+# SEGMENT CONFIG
+# =========================================================
+
+MIN_DT_MS = EXPECTED_DT_MS * 0.5
+MAX_DT_MS = EXPECTED_DT_MS * 1.5
+GAP_THRESHOLD_MS = MAX_ALLOWED_GAP_MS
+
+MIN_SEGMENT_SECONDS = 2
+MIN_SEGMENT_SAMPLES = SAMPLING_RATE_HZ * MIN_SEGMENT_SECONDS
+
+REQUIRED_COLUMNS = ["timestamp_ms", *FEATURE_COLUMNS, "label"]
+
+AUTO_CLEAN_OUTPUT = True
+
+
+# =========================================================
+# CLI ARGUMENTS
+# =========================================================
+
+def parse_args():
+    """
+    Parse command-line arguments.
+    """
+
+    parser = argparse.ArgumentParser(
+        description="Split raw sensor CSV files into valid continuous segments."
+    )
+
+    parser.add_argument(
+        "--no-clean",
+        action="store_true",
+        help="Do not delete old segment output before running.",
+    )
+
+    return parser.parse_args()
+
+
+# =========================================================
+# UTILITY FUNCTIONS
+# =========================================================
+
+def prepare_output_dir(output_root: Path, auto_clean: bool = True) -> None:
+    """
+    Prepare segment output directory.
+
+    If auto_clean is enabled, old segment files are removed first.
+    This prevents stale segment files from mixing with the current run.
+    """
+
+    if auto_clean and output_root.exists():
+        shutil.rmtree(output_root)
+
+    output_root.mkdir(parents=True, exist_ok=True)
+
+
+def infer_label_from_path(file_path: Path) -> str | None:
+    """
+    Infer label from parent folder or file name.
+
+    Priority:
+        1. Parent folder name
+        2. File name
+    """
+
+    parent_name = file_path.parent.name.lower().strip()
+
+    if parent_name in CLASS_LABELS:
+        return parent_name
+
+    file_name = file_path.name.lower().strip()
+
+    matched_labels = set()
+
+    for alias, canonical_label in LABEL_ALIASES.items():
+        if alias in file_name:
+            matched_labels.add(canonical_label)
+
+    if len(matched_labels) == 1:
+        return next(iter(matched_labels))
+
+    return None
+
+
+def normalize_label(value) -> str:
+    """
+    Normalize label value to lowercase string.
+    """
+    normalized = str(value).lower().strip()
+    return LABEL_ALIASES.get(normalized, normalized)
+
+
+def rewrite_labels_from_filename(df: pd.DataFrame, file_path: Path) -> tuple[pd.DataFrame, str, bool]:
+    """
+    Force the label column to match the class inferred from the file path.
+
+    Returns:
+        updated dataframe, canonical label, whether any row was changed
+    """
+
+    inferred_label = infer_label_from_path(file_path)
+
+    if inferred_label is None:
+        raise ValueError(f"Cannot infer label from file name/path: {file_path}")
+
+    inferred_label = normalize_label(inferred_label)
+
+    if inferred_label not in CLASS_LABELS:
+        raise ValueError(f"Inferred invalid label '{inferred_label}' from {file_path}")
+
+    label_exists = "label" in df.columns
+
+    if label_exists:
+        current_labels = (
+            df["label"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            .map(normalize_label)
+        )
+        labels_changed = not current_labels.eq(inferred_label).all()
+    else:
+        labels_changed = True
+
+    df["label"] = inferred_label
+
+    return df, inferred_label, labels_changed
+
+
+def collect_input_files(input_root: Path) -> list[Path]:
+    """
+    Collect CSV files from the accepted deployment input root.
+    """
+
+    if not input_root.exists():
+        raise FileNotFoundError(f"Input root does not exist: {input_root}")
+
+    files = sorted(input_root.rglob("*.csv"))
+
+    if not files:
+        raise FileNotFoundError(f"No CSV files found under: {input_root}")
+
+    return files
+
+# =========================================================
+# VALIDATION
+# =========================================================
+
+def validate_dataframe(df: pd.DataFrame, file_path: Path) -> str:
+    """
+    Validate one raw dataframe before segment splitting.
+
+    Returns:
+        normalized label
+    """
+
+    if df.empty:
+        raise ValueError(f"Empty input file: {file_path}")
+
+    missing_cols = [col for col in REQUIRED_COLUMNS if col not in df.columns]
+
+    if missing_cols:
+        raise ValueError(f"Missing columns in {file_path}: {missing_cols}")
+
+    label = normalize_label(df["label"].iloc[0])
+
+    if label not in CLASS_LABELS:
+        raise ValueError(f"Invalid label '{label}' in file: {file_path}")
+
+    df["label"] = label
+
+    return label
+
+
+def normalize_numeric_columns(df: pd.DataFrame, file_path: Path) -> pd.DataFrame:
+    """
+    Convert timestamp and accelerometer columns to numeric values.
+    Strictly drop rows containing NaN or invalid formatting to protect 
+    the continuity of the data stream.
+    """
+    numeric_columns = ["timestamp_ms", *FEATURE_COLUMNS]
+
+    # Ép kiểu số thực toàn bộ các cột quan trọng, biến chuỗi lỗi thành NaN
+    for column in numeric_columns:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+
+    # Loại bỏ thẳng tay các dòng chứa NaN ở các cột cốt lõi
+    # Việc này giúp bảo vệ phép tính RMS và FFT ở các bước sau không bị dính nhiễu NaN
+    df = df.dropna(subset=numeric_columns).copy()
+
+    if df.empty:
+        raise ValueError(f"No valid numeric rows left after cleaning: {file_path}")
+
+    return df
+
+
+# =========================================================
+# SEGMENT SPLITTING
+# =========================================================
+
+# 
+def find_breakpoints(df: pd.DataFrame) -> list[int]:
+    timestamps = df["timestamp_ms"].to_numpy()
+    
+    # Tính hiệu số giữa các phần tử liên tiếp bằng toán tử vector
+    dt_ms = np.diff(timestamps)
+    
+    # Lấy ra mảng chỉ mục vi phạm điều kiện (cộng 1 vì np.diff làm giảm 1 chiều dài mảng)
+    breakpoints = np.where((dt_ms <= 0) | (dt_ms > GAP_THRESHOLD_MS))[0] + 1
+    
+    return breakpoints.tolist()
+
+
+def split_segments(df: pd.DataFrame) -> list[pd.DataFrame]:
+    """
+    Split one dataframe into continuous timestamp segments.
+    """
+
+    breakpoints = find_breakpoints(df)
+
+    segments = []
+    start_idx = 0
+
+    for breakpoint_idx in breakpoints:
+        segment = df.iloc[start_idx:breakpoint_idx].copy()
+        segments.append(segment)
+        start_idx = breakpoint_idx
+
+    last_segment = df.iloc[start_idx:].copy()
+    segments.append(last_segment)
+
+    return segments
+
+
+# =========================================================
+# FILE PROCESSING
+# =========================================================
+
+def process_file(file_path: Path, output_root: Path) -> list[dict]:
+    """
+    Process one raw CSV file and save valid segments.
+    """
+    df = pd.read_csv(file_path)
+    
+    # Chỉ cập nhật nhãn trong bộ nhớ RAM, TUYỆT ĐỐI không gọi df.to_csv(file_path) 
+    # để tránh làm hỏng/thay đổi dữ liệu thô gốc (Raw data)
+    df, inferred_label, labels_changed = rewrite_labels_from_filename(df, file_path)
+
+    label = validate_dataframe(df, file_path)
+    df = normalize_numeric_columns(df, file_path)
+
+    segments = split_segments(df)
+
+    label_output_dir = output_root / label
+    label_output_dir.mkdir(parents=True, exist_ok=True)
+
+    report_rows = []
+    kept_count = 0
+    base_name = file_path.stem
+
+    for segment_id, segment in enumerate(segments):
+        if segment.empty:
+            status = "REJECTED"
+            reason = "empty_segment"
+            output_file = None
+
+        elif len(segment) < MIN_SEGMENT_SAMPLES:
+            status = "REJECTED"
+            reason = "too_short"
+            output_file = None
+
+        else:
+            status = "KEPT"
+            reason = "valid"
+
+            output_name = f"{base_name}_segment_{kept_count:03d}.csv"
+            output_path = label_output_dir / output_name
+
+            segment.to_csv(output_path, index=False)
+            output_file = str(output_path)
+            kept_count += 1
+
+        report_rows.append({
+            "source_file": str(file_path),
+            "output_file": output_file,
+            "label": label,
+            "segment_id": segment_id,
+            "kept_segment_id": kept_count - 1 if status == "KEPT" else None,
+            "start_time_ms": segment["timestamp_ms"].iloc[0] if not segment.empty else None,
+            "end_time_ms": segment["timestamp_ms"].iloc[-1] if not segment.empty else None,
+            "num_samples": len(segment),
+            "duration_sec": len(segment) / SAMPLING_RATE_HZ,
+            "sampling_rate_hz": SAMPLING_RATE_HZ,
+            "expected_dt_ms": EXPECTED_DT_MS,
+            "min_dt_ms": MIN_DT_MS,
+            "max_dt_ms": MAX_DT_MS,
+            "label_from_filename": inferred_label,
+            "labels_rewritten": labels_changed,
+            "min_segment_samples": MIN_SEGMENT_SAMPLES,
+            "status": status,
+            "reason": reason,
+        })
+
+    return report_rows
+
+
+# =========================================================
+# MAIN PIPELINE
+# =========================================================
+
+def run_segmenter(auto_clean: bool = True) -> None:
+    """
+    Run segment splitting pipeline for accepted deployment data.
+    """
+
+    paths = get_paths()
+
+    input_root = paths["accepted"]
+    output_root = paths["segments"]
+    report_path = paths["segment_report"]
+
+    print("=" * 70)
+    print("SEGMENTER PIPELINE STARTED")
+    print("=" * 70)
+    print(f"Input root           : {input_root}")
+    print(f"Output root          : {output_root}")
+    print(f"Report path          : {report_path}")
+    print(f"Sampling rate        : {SAMPLING_RATE_HZ} Hz")
+    print(f"Sample period        : {SAMPLE_PERIOD_MS:.3f} ms")
+    print(f"Expected dt          : {EXPECTED_DT_MS:.3f} ms")
+    print(f"Max gap allowed      : {GAP_THRESHOLD_MS:.3f} ms")
+    print(f"Min segment seconds  : {MIN_SEGMENT_SECONDS}")
+    print(f"Min segment samples  : {MIN_SEGMENT_SAMPLES}")
+    print(f"Auto clean output    : {auto_clean}")
+    print("=" * 70)
+
+    prepare_output_dir(output_root, auto_clean=auto_clean)
+
+    input_files = collect_input_files(input_root)
+
+    all_report_rows = []
+    failed_files = []
+
+    for file_path in input_files:
+        try:
+            rows = process_file(
+                file_path=file_path,
+                output_root=output_root,
+            )
+
+            all_report_rows.extend(rows)
+
+            kept_count = sum(1 for row in rows if row["status"] == "KEPT")
+            rejected_count = sum(1 for row in rows if row["status"] == "REJECTED")
+
+            print(
+                f"[OK] {file_path.name} | kept={kept_count} | rejected={rejected_count}"
+            )
+
+        except Exception as exc:
+            failed_files.append({
+                "source_file": str(file_path),
+                "output_file": None,
+                "label": None,
+                "segment_id": None,
+                "kept_segment_id": None,
+                "start_time_ms": None,
+                "end_time_ms": None,
+                "num_samples": None,
+                "duration_sec": None,
+                "sampling_rate_hz": SAMPLING_RATE_HZ,
+                "expected_dt_ms": EXPECTED_DT_MS,
+                "min_dt_ms": MIN_DT_MS,
+                "max_dt_ms": MAX_DT_MS,
+                "label_from_filename": infer_label_from_path(file_path),
+                "labels_rewritten": None,
+                "min_segment_samples": MIN_SEGMENT_SAMPLES,
+                "status": "FAILED",
+                "reason": str(exc),
+            })
+
+            print(f"[FAIL] {file_path.name}: {exc}")
+
+    report_rows = all_report_rows + failed_files
+
+    if not report_rows:
+        print("No report rows generated.")
+        return
+
+    report_df = pd.DataFrame(report_rows)
+
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_df.to_csv(report_path, index=False)
+
+    print("=" * 70)
+    print("SEGMENTER PIPELINE COMPLETED")
+    print("=" * 70)
+    print(f"Report saved to      : {report_path}")
+    print(f"Input files          : {len(input_files)}")
+    print(f"Failed files         : {len(failed_files)}")
+    print(f"Total report rows    : {len(report_df)}")
+    print("-" * 70)
+
+    if "label" in report_df.columns and "status" in report_df.columns:
+        print("Segment count by label/status:")
+        print(report_df.groupby(["label", "status"]).size())
+
+    print("=" * 70)
+
+
+def main() -> None:
+    """
+    Entry point for command-line execution.
+    """
+
+    args = parse_args()
+
+    run_segmenter(
+        auto_clean=not args.no_clean,
+    )
+
+
+if __name__ == "__main__":
+    main()
