@@ -40,7 +40,7 @@ const unsigned long sampleIntervalUs = 2000; // 500Hz = 2000 microseconds (2ms)
 // --- WiFi Configuration ---
 const char* ssid = "Hans";
 const char* password = "succmanuts";
-const char* mqtt_server = "10.98.57.10"; // e.g., "broker.hivemq.com"
+const char* mqtt_server = "10.169.156.10"; // e.g., "broker.hivemq.com"
 
 
 bool windowReady = false;   

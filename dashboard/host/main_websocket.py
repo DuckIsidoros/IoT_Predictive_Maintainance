@@ -33,13 +33,19 @@ async def mqtt_listener():
                         data = json.loads(message.payload.decode())
                         latest_data = data
 
+                        features = data.get("features", {})
+                        rms = features.get("rms", {})
+                        bp = features.get("band_power", {})
+
                         async with aiosqlite.connect("vibration_data.db") as db:
                             await db.execute(
-                                "INSERT INTO vibration_logs (timestamp, prediction, confidence, fan_state) VALUES (?, ?, ?, ?)",
+                                "INSERT INTO vibration_logs (timestamp, prediction, confidence, fan_state, rms_x, rms_y, rms_z, bp_low, bp_mid, bp_high) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                                 (data.get("timestamp"),
                                 data["inference"]["prediction"],
                                 data["inference"]["confidence"],
-                                data["status"]["fan_state"])
+                                data["status"]["fan_state"],
+                                rms.get("x"), rms.get("y"), rms.get("z"),
+                                bp.get("low"), bp.get("mid"), bp.get("high"))
                             )
                             await db.commit()
 
@@ -59,7 +65,35 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError: pass
 
 app = FastAPI(lifespan=lifespan)
+## For CSV export
+from fastapi.responses import StreamingResponse
+import csv
+import io
 
+@app.get("/api/export/csv")
+async def export_csv():
+    async with aiosqlite.connect("vibration_data.db") as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM vibration_logs ORDER BY id DESC") as cursor:
+            rows = await cursor.fetchall()
+
+    def generate():
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["id", "timestamp", "prediction", "confidence", "fan_state", "rms_x", "rms_y", "rms_z", "bp_low", "bp_mid", "bp_high"])
+        for row in rows:
+            writer.writerow([row["id"], row["timestamp"], row["prediction"], row["confidence"], row["fan_state"],
+                            row["rms_x"], row["rms_y"], row["rms_z"], row["bp_low"], row["bp_mid"], row["bp_high"]])
+            yield output.getvalue()
+            output.truncate(0)
+            output.seek(0)
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=vibration_logs.csv"}
+    )
+## For CSV export
 @app.websocket("/ws/dashboard")
 async def dashboard_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -83,7 +117,13 @@ async def init_db():
                 timestamp TEXT,
                 prediction TEXT,
                 confidence REAL,
-                fan_state TEXT
+                fan_state TEXT,
+                rms_x REAL,
+                rms_y REAL,
+                rms_z REAL,
+                bp_low REAL,
+                bp_mid REAL,
+                bp_high REAL
             )
         """)
         await db.commit()
