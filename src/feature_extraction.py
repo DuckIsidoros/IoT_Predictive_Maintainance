@@ -20,9 +20,9 @@ from config import (
 # Feature band configuration
 # =========================
 
-LOW_BAND = (0.0, 20.0)
-MID_BAND = (20.0, 60.0)
-HIGH_BAND = (60.0, 100.0)
+LOW_BAND = (50.0, 80.0)
+MID_BAND = (110.0, 140.0)
+HIGH_BAND = (170.0, 210.0)
 
 AUTO_CLEAN_OUTPUT = True
 

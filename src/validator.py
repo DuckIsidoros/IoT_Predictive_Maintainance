@@ -500,7 +500,7 @@ def run_validation(mode, move_real_files=False, accept_warnings=False):
     Run validation pipeline for mock or real mode.
     """
 
-    paths = get_paths(mode)
+    paths = get_paths()
 
     if mode == "mock":
         files = collect_mock_files(paths)

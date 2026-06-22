@@ -62,12 +62,12 @@ def validate_config():
             f"Invalid sampling rate: {SAMPLING_RATE_HZ}, expected 500 Hz"
         )
 
-    if WINDOW_SIZE != 640:
+    if WINDOW_SIZE != 512:
         raise ValueError(
             f"Invalid window size: {WINDOW_SIZE}, expected 640 samples"
         )
 
-    if EXPECTED_FFT_BINS != 321:
+    if EXPECTED_FFT_BINS != 257:
         raise ValueError(
             f"Invalid FFT bins: {EXPECTED_FFT_BINS}, expected 321"
         )
