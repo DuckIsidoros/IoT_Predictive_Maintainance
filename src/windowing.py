@@ -58,7 +58,7 @@ def validate_config():
             f"Invalid sampling rate: {SAMPLING_RATE_HZ}, expected 500 Hz"
         )
 
-    if WINDOW_SIZE != 256:
+    if WINDOW_SIZE != 640:
         raise ValueError(
             f"Invalid window size: {WINDOW_SIZE}, expected 640 samples"
         )
@@ -68,15 +68,18 @@ def validate_config():
             f"Invalid overlap ratio: {OVERLAP_RATIO}, expected 0.5"
         )
 
-    if STEP_SIZE != 320:
-        raise ValueError(
-            f"Invalid stride: {STEP_SIZE}, expected 320 samples"
-        )
+    # [CHANGED]
+expected_step = int(WINDOW_SIZE * (1 - OVERLAP_RATIO))
 
-    if MAX_WINDOWS_PER_CLASS <= 0:
-        raise ValueError(
-            f"Invalid max windows per class: {MAX_WINDOWS_PER_CLASS}, expected positive integer"
-        )
+if STEP_SIZE != expected_step:
+    raise ValueError(
+        f"Invalid stride: {STEP_SIZE}, expected {expected_step} samples"
+    )
+
+if MAX_WINDOWS_PER_CLASS <= 0:
+    raise ValueError(
+        f"Invalid max windows per class: {MAX_WINDOWS_PER_CLASS}, expected positive integer"
+    )
 
 def validate_segment_dataframe(df, file_path):
     """

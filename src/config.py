@@ -13,7 +13,7 @@ FEATURE_COLUMNS = ["accX_raw", "accY_raw", "accZ_raw", "accZ_filt"]
 HPF_ALPHA = 0.9936
 MAX_ALLOWED_GAP_MS = 5.0
 
-WINDOW_SIZE = 256
+WINDOW_SIZE = 640
 OVERLAP_RATIO = 0.5
 STEP_SIZE = 320
 

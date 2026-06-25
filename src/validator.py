@@ -18,7 +18,7 @@ from config import (
 # VALIDATION CONFIG
 # =========================================================
 
-REQUIRED_COLUMNS = ["timestamp_ms", "accX", "accY", "accZ"]
+REQUIRED_COLUMNS = ["timestamp_ms", "accX_raw", "accY_raw", "accZ_raw", "accZ_filt"]
 
 OPTIONAL_LABEL_COLUMN = "label"
 
@@ -262,7 +262,7 @@ def validate_file(file_path, expected_status=None, mode="mock"):
         result["decision"] = result["status"]
         return result
     # Check numeric columns and count NaN/inf/extreme values
-    numeric_columns = ["timestamp_ms", "accX", "accY", "accZ"]
+    numeric_columns = ["timestamp_ms", "accX_raw", "accY_raw", "accZ_raw", "accZ_filt"]
     # Convert to numeric and count non-numeric values as NaN
     for column in numeric_columns:
         df[column] = safe_numeric_series(df, column)
@@ -279,7 +279,7 @@ def validate_file(file_path, expected_status=None, mode="mock"):
     if inf_rows > 0:
         add_reason(result, "FAIL", "inf_values_detected")
 
-    sensor_abs_max = df[["accX", "accY", "accZ"]].abs().max(axis=1)
+    sensor_abs_max = df[["accX_raw", "accY_raw", "accZ_raw"]].abs().max(axis=1)
     extreme_rows = (sensor_abs_max > MAX_ABS_ACCEL_VALUE).sum()
     result["num_extreme_sensor_rows"] = int(extreme_rows)
 
@@ -323,7 +323,10 @@ def validate_file(file_path, expected_status=None, mode="mock"):
     result["num_large_gaps"] = int(len(large_gaps))
 
     if len(large_gaps) > 0:
-        add_reason(result, "FAIL", "large_timestamp_gap")
+        if mode == "real":
+            add_reason(result, "WARNING", "large_timestamp_gap_warning")
+        else:
+            add_reason(result, "FAIL", "large_timestamp_gap")
 
         estimated_missing = ((large_gaps / EXPECTED_DT_MS).round() - 1).sum()
         result["estimated_missing_samples"] = int(max(0, estimated_missing))
@@ -432,7 +435,7 @@ def route_real_file(file_path, status, paths, accept_warnings=False):
     should_accept = status == "PASS" or (status == "WARNING" and accept_warnings)
 
     if should_accept:
-        target_dir = paths["raw"]
+        target_dir = paths["accepted"]
     else:
         target_dir = paths["rejected"]
 

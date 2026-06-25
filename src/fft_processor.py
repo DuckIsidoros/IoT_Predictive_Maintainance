@@ -62,7 +62,7 @@ def validate_config():
             f"Invalid sampling rate: {SAMPLING_RATE_HZ}, expected 500 Hz"
         )
 
-    if WINDOW_SIZE != 256:
+    if WINDOW_SIZE != 640:
         raise ValueError(
             f"Invalid window size: {WINDOW_SIZE}, expected 640 samples"
         )
@@ -243,7 +243,7 @@ def process_window_file(file_path: Path, output_dir: Path) -> dict:
         "dc_removed": True,
         "window_function": "hann",
         "fft_type": "rfft",
-        "signal_type": "accZ",
+        "signal_type": "accZ_filt",
 
         "status": "OK",
         "reason": "valid",
@@ -348,7 +348,7 @@ def main():
                         "dc_removed": True,
                         "window_function": "hann",
                         "fft_type": "rfft",
-                        "signal_type": "accZ",
+                        "signal_type": "accZ_filt",
                         "status": "FAIL",
                         "reason": str(e),
                     }
