@@ -62,9 +62,9 @@ def validate_config():
             f"Invalid sampling rate: {SAMPLING_RATE_HZ}, expected 500 Hz"
         )
 
-    if WINDOW_SIZE != 640:
+    if WINDOW_SIZE != 512:
         raise ValueError(
-            f"Invalid window size: {WINDOW_SIZE}, expected 640 samples"
+            f"Invalid window size: {WINDOW_SIZE}, expected 512 samples"
         )
 
     if EXPECTED_FREQ_MAX_HZ != 250:
@@ -240,7 +240,7 @@ def process_window_file(file_path: Path, output_dir: Path) -> dict:
         "max_frequency_hz": freqs[-1],
         "nyquist_frequency_hz": NYQUIST_FREQUENCY_HZ,
 
-        "dc_removed": True,
+        "dc_removed": False,
         "window_function": "hann",
         "fft_type": "rfft",
         "signal_type": "accZ_filt",
