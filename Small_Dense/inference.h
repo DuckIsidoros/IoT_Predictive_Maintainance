@@ -1,4 +1,4 @@
-/*
+    /*
  * inference.h
  * Forward pass engine for Small Dense NN on ESP32 (Arduino IDE).
  *

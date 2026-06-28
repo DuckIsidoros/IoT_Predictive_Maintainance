@@ -26,7 +26,7 @@
  * ═══════════════════════════════════════════════════════════════════════ */
 const char *WIFI_SSID = "Hans";
 const char *WIFI_PASSWORD = "succmanuts";
-const char *MQTT_SERVER = "10.98.57.10";
+const char *MQTT_SERVER = "10.142.30.10";
 const int MQTT_PORT = 1883;
 const char *MQTT_TOPIC = "vibration/inference";
 
@@ -59,6 +59,7 @@ PubSubClient mqttClient(espClient);
 #define HPF_ALPHA 0.9936f
 static float prev_raw[3] = {0.0f, 0.0f, 0.0f};
 static float prev_filt[3] = {0.0f, 0.0f, 0.0f};
+static float fft_magnitudes[32];
 
 /* ═══════════════════════════════════════════════════════════════════════
  * 4. WINDOW BUFFERS
@@ -155,26 +156,52 @@ void publish_mqtt(const InferenceResult &result, const float *features)
 
     String payload = "{";
     payload += "\"timestamp\":" + String(millis()) + ",";
+
+    payload += "\"inference\":{";
     payload += "\"prediction\":\"" + String(result.label) + "\",";
     payload += "\"confidence\":" + String(result.confidence, 4) + ",";
     payload += "\"scores\":{";
     for (uint8_t i = 0; i < MODEL_NUM_CLASSES; i++)
     {
         payload += "\"" + String(MODEL_CLASS_LABELS[i]) + "\":" + String(result.probs[i], 4);
-        if (i < MODEL_NUM_CLASSES - 1)
-            payload += ",";
+        if (i < MODEL_NUM_CLASSES - 1) payload += ",";
     }
-    payload += "},";
+    payload += "}},";
+
+    payload += "\"status\":{\"fan_state\":\"Running\",\"sensor_health\":\"OK\",\"connection\":\"Connected\"},";
+
     payload += "\"features\":{";
-    payload += "\"RMS_X\":" + String(features[0], 6) + ",";
-    payload += "\"RMS_Y\":" + String(features[1], 6) + ",";
-    payload += "\"RMS_Z\":" + String(features[2], 6) + ",";
-    payload += "\"Band_Power_Z_Low\":" + String(features[3], 6) + ",";
-    payload += "\"Band_Power_Z_Mid\":" + String(features[4], 6) + ",";
-    payload += "\"Band_Power_Z_High\":" + String(features[5], 6) + ",";
-    payload += "\"CrestFactor_Z\":" + String(features[6], 6) + ",";
-    payload += "\"Kurtosis_Z\":" + String(features[7], 6);
-    payload += "}}";
+    payload += "\"rms\":{\"x\":" + String(features[0], 6) + ",\"y\":" + String(features[1], 6) + ",\"z\":" + String(features[2], 6) + "},";
+    payload += "\"band_power\":{\"low\":" + String(features[3], 6) + ",\"mid\":" + String(features[4], 6) + ",\"high\":" + String(features[5], 6) + "},";
+    payload += "\"band_level\":\"normal\"},";
+
+    payload += "\"fft\":{\"magnitudes\":[";
+    for (uint8_t i = 0; i < 32; i++) {
+        payload += String(fft_magnitudes[i], 4);
+        if (i < 31) payload += ",";
+    }
+    payload += "]},";
+
+    payload += "\"raw\":{\"ax\":[";
+    for (uint8_t i = 0; i < 20; i++) {
+        payload += String(buf_x[WINDOW_SIZE - 20 + i], 3);
+        if (i < 19) payload += ",";
+    }
+    payload += "],\"ay\":[";
+    for (uint8_t i = 0; i < 20; i++) {
+        payload += String(buf_y[WINDOW_SIZE - 20 + i], 3);
+        if (i < 19) payload += ",";
+    }
+    payload += "],\"az\":[";
+    for (uint8_t i = 0; i < 20; i++) {
+        payload += String(buf_z[WINDOW_SIZE - 20 + i], 3);
+        if (i < 19) payload += ",";
+    }
+    payload += "]}";
+
+    payload += "}";
+
+    Serial.printf("[MQTT] Payload: %d bytes\n", payload.length());
 
     if (mqttClient.beginPublish(MQTT_TOPIC, payload.length(), false))
     {
@@ -410,13 +437,10 @@ void precompute_tables()
  * ═══════════════════════════════════════════════════════════════════════ */
 void extract_features(float *features)
 {
-
-    // -- Time-domain --------------------------------------------------
     float rms_x = compute_rms(buf_x, WINDOW_SIZE);
     float rms_y = compute_rms(buf_y, WINDOW_SIZE);
     float rms_z = compute_rms(buf_z, WINDOW_SIZE);
 
-    // Detrend accZ (khớp Python: acc_z - mean trước khi tính CF & Kurt)
     float mean_z = 0.0f;
     for (uint16_t i = 0; i < WINDOW_SIZE; i++)
         mean_z += buf_z[i];
@@ -424,29 +448,38 @@ void extract_features(float *features)
 
     float buf_z_detrend[WINDOW_SIZE];
     for (uint16_t i = 0; i < WINDOW_SIZE; i++)
-    {
         buf_z_detrend[i] = buf_z[i] - mean_z;
-    }
 
     float rms_z_dt = compute_rms(buf_z_detrend, WINDOW_SIZE);
     float crest_factor_z = compute_crest_factor(buf_z_detrend, WINDOW_SIZE, rms_z_dt);
     float kurtosis_z = compute_kurtosis(buf_z, WINDOW_SIZE);
 
-    // -- Frequency-domain: apply Hann window once, then reuse ---------
     float buf_z_win[WINDOW_SIZE];
     for (uint16_t i = 0; i < WINDOW_SIZE; i++)
-    {
         buf_z_win[i] = buf_z[i] * hann[i];
+
+    float inv_n = 1.0f / WINDOW_SIZE;
+    for (uint8_t k = 0; k < 32; k++)
+    {
+        float delta = 2.0f * M_PI * k * inv_n;
+        float cos_d = cosf(delta), sin_d = sinf(delta);
+        float c = 1.0f, s = 0.0f, re = 0.0f, im = 0.0f;
+        for (uint16_t i = 0; i < WINDOW_SIZE; i++)
+        {
+            re += buf_z_win[i] * c;
+            im -= buf_z_win[i] * s;
+            float cn = c * cos_d - s * sin_d;
+            float sn = s * cos_d + c * sin_d;
+            c = cn;
+            s = sn;
+        }
+        fft_magnitudes[k] = sqrtf(re * re + im * im) * inv_n;
     }
 
-    float bp_low = compute_band_power_fast(buf_z_win, WINDOW_SIZE,
-                                           LOW_BAND_LOW_HZ, LOW_BAND_HIGH_HZ);
-    float bp_mid = compute_band_power_fast(buf_z_win, WINDOW_SIZE,
-                                           MID_BAND_LOW_HZ, MID_BAND_HIGH_HZ);
-    float bp_high = compute_band_power_fast(buf_z_win, WINDOW_SIZE,
-                                            HIGH_BAND_LOW_HZ, HIGH_BAND_HIGH_HZ, true);
+    float bp_low  = compute_band_power_fast(buf_z_win, WINDOW_SIZE, LOW_BAND_LOW_HZ,  LOW_BAND_HIGH_HZ);
+    float bp_mid  = compute_band_power_fast(buf_z_win, WINDOW_SIZE, MID_BAND_LOW_HZ,  MID_BAND_HIGH_HZ);
+    float bp_high = compute_band_power_fast(buf_z_win, WINDOW_SIZE, HIGH_BAND_LOW_HZ, HIGH_BAND_HIGH_HZ, true);
 
-    // -- Pack ----------------------------------------------------------
     features[0] = rms_x;
     features[1] = rms_y;
     features[2] = rms_z;
@@ -456,12 +489,9 @@ void extract_features(float *features)
     features[6] = crest_factor_z;
     features[7] = kurtosis_z;
 
-    // Debug: in tổng năng lượng signal sau Hann
     float total_energy = 0.0f;
     for (uint16_t i = 0; i < WINDOW_SIZE; i++)
-    {
         total_energy += buf_z_win[i] * buf_z_win[i];
-    }
     Serial.print(F("Total Z energy after Hann: "));
     Serial.println(total_energy, 8);
 }
