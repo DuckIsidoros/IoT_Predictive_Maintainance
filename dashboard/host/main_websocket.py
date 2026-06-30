@@ -31,6 +31,9 @@ async def mqtt_listener():
                 async for message in client.messages:
                     try:
                         data = json.loads(message.payload.decode())
+                        if "inference" not in data:
+                            print(f"Unexpected payload keys: {list(data.keys())}")  # see what you're actually getting
+                            continue
                         latest_data = data
 
                         features = data.get("features", {})
@@ -128,7 +131,7 @@ async def init_db():
         """)
         await db.commit()
 
-            
+
 @app.get("/api/history")
 async def get_history():
     async with aiosqlite.connect("vibration_data.db") as db:

@@ -35,7 +35,7 @@ const unsigned long sampleIntervalUs = 2000;
 
 const char *ssid = "Hans";
 const char *password = "succmanuts";
-const char *mqtt_server = "10.98.57.10";
+const char *mqtt_server = "10.142.30.10";
 
 bool windowReady = false;
 float latestSqX = 0.0f;
